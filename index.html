@@ -58,11 +58,40 @@ const meta = {
   best: +store.get('qt_best') || 0,
   coins: store.get('qt_coins') == null ? 100 : +store.get('qt_coins'),
   inv: (() => { try { return JSON.parse(store.get('qt_inv')) || null; } catch (e) { return null; } })() || { undo: 3, coffee: 2, chair: 1 },
+  bus: store.get('qt_bus') || 'classic',
+  owned: (() => { try { return JSON.parse(store.get('qt_owned')) || null; } catch (e) { return null; } })() || ['classic'],
+  look: store.get('qt_look') || 'none',
+  ownedLooks: (() => { try { return JSON.parse(store.get('qt_looks')) || null; } catch (e) { return null; } })() || ['none'],
+  daily: (() => { try { return JSON.parse(store.get('qt_daily')) || null; } catch (e) { return null; } })() || { last: -9, streak: 0, best: 0 },
 };
 function saveMeta() {
   store.set('qt_level', meta.level); store.set('qt_best', meta.best);
   store.set('qt_coins', meta.coins); store.set('qt_inv', JSON.stringify(meta.inv));
+  store.set('qt_bus', meta.bus); store.set('qt_owned', JSON.stringify(meta.owned));
+  store.set('qt_look', meta.look); store.set('qt_looks', JSON.stringify(meta.ownedLooks));
+  store.set('qt_daily', JSON.stringify(meta.daily));
 }
+
+// Worker looks: accessories on top of the route-colored outfit, so color matching never changes.
+const WORKER_SKINS = [
+  { id: 'none',   name: 'Business Casual', price: 0,   desc: 'Khakis. Lanyard. Dread.' },
+  { id: 'cap',    name: 'Ball Caps',       price: 120, desc: 'Casual Friday, every day.' },
+  { id: 'phones', name: 'Headphones',      price: 200, desc: 'Can\'t hear you, clocked out.' },
+  { id: 'shades', name: 'Sunglasses',      price: 300, desc: 'Too cool for standup.' },
+  { id: 'party',  name: 'Party Hats',      price: 450, desc: 'It\'s somebody\'s birthday.' },
+  { id: 'crown',  name: 'Crowns',          price: 800, desc: 'Employee of the month. All of them.' },
+];
+
+// Bus skins. Body keeps the route color so matching still works; only the style changes.
+const BUS_SKINS = [
+  { id: 'classic', name: 'City Shuttle',   price: 0,   h: 60, desc: 'Gets you home. Barely.' },
+  { id: 'decker',  name: 'Double Decker',  price: 150, h: 60, desc: 'Twice the bus, same commute.' },
+  { id: 'camper',  name: 'Retro Camper',   price: 250, h: 60, desc: 'Surf\'s up. Email\'s down.' },
+  { id: 'limo',    name: 'Stretch Limo',   price: 400, h: 48, desc: 'Expensed. Obviously.' },
+  { id: 'party',   name: 'Party Bus',      price: 600, h: 60, desc: 'The happy hour starts now.' },
+  { id: 'rocket',  name: 'Rocket Shuttle', price: 900, h: 56, desc: 'Zero to weekend in 3 seconds.' },
+];
+const skinById = id => BUS_SKINS.find(s => s.id === id) || BUS_SKINS[0];
 
 // ---------- Audio ----------
 let AC = null, muted = store.get('qt_mute') === '1';
@@ -136,14 +165,23 @@ function sim(order, seq, B) {
   return bi === seq.length;
 }
 
-function genLevel(L) {
-  const rnd = mulberry32(L * 7919 + 17);
-  const cols = Math.min(5, 3 + Math.floor(L / 4));
+// Late-game difficulty knobs, in one place so they are easy to tune.
+//  L20+: locked "meeting" cubicles   L25+: 6-wide boards   L30+: shuttle queue partly hidden
+//  L40+: only 4 chairs                L50+: only the shuttle at the stop is visible
+//  6-crowds and mystery cubicles keep ramping until L50; shuffling keeps ramping forever.
+const fogFrom = L => L >= 50 ? 1 : L >= 30 ? 2 : 99;
+const isBoss = L => L >= 10 && L % 10 === 0;
+
+function genLevel(L, seed, boss = isBoss(L)) {
+  const rnd = mulberry32(seed == null ? L * 7919 + 17 : seed);
+  const cols = Math.min(L >= 25 ? 6 : 5, 3 + Math.floor(L / 4));
   const rows = Math.min(7, 3 + Math.floor(L / 3));
   const ncol = Math.min(PAL.length, 2 + Math.floor((L + 2) / 3));
-  const B = L <= 5 ? 7 : L <= 14 ? 6 : 5;
-  const big = Math.min(.3, L * .025);
-  const mys = L >= 5 ? Math.min(.3, (L - 4) * .04) : 0;
+  const B = L <= 5 ? 7 : L <= 14 ? 6 : L < 40 ? 5 : 4;
+  const late = Math.max(0, Math.min(30, L - 20)) * .005;
+  const big = Math.min(.3, L * .025) + late;
+  const mys = (L >= 5 ? Math.min(.3, (L - 4) * .04) : 0) + late;
+  const lockP = L >= 20 ? Math.min(.35, .08 + (L - 20) * .01) : 0;
   const g = [];
   for (let r = 0; r < rows; r++) {
     g.push([]);
@@ -159,30 +197,54 @@ function genLevel(L) {
     const [r, c] = list[Math.floor(rnd() * list.length)];
     order.push(tmp[r][c]); tmp[r][c] = null;
   }
+  // Locks: a cubicle "in a meeting" opens after N total taps. N never exceeds its slot in the
+  // known solution order, so the level always stays solvable.
+  order.forEach((h, k) => {
+    if (k >= 3 && rnd() < lockP) h.lock = Math.min(k, 2 + Math.floor(rnd() * Math.min(12, 3 + L / 8)));
+  });
   const seq = [];
   for (const h of order) for (let k = 0; k < h.n / 3; k++) seq.push(h.color);
-  const tries = 10 + L * 12, md = 2 + Math.floor(L / 3);
+  const tries = Math.round((10 + L * 12) * (boss ? 1.6 : 1)), md = 2 + Math.floor(L / 3) + (boss ? 2 : 0);
   for (let t = 0; t < tries; t++) {
     const i = Math.floor(rnd() * seq.length), j = i + 1 + Math.floor(rnd() * md);
     if (j >= seq.length || seq[i] === seq[j]) continue;
     [seq[i], seq[j]] = [seq[j], seq[i]];
     if (!sim(order, seq, B)) [seq[i], seq[j]] = [seq[j], seq[i]];
   }
-  return { grid: g, rows, cols, B, seq };
+  return { grid: g, rows, cols, B, seq, order };
 }
 
 // ---------- Game state ----------
 let S = null;
 
-function startLevel(L) {
-  const lv = genLevel(L);
+const dailyAvailable = () => meta.daily.last !== dayIndex() && meta.best >= 3;
+// "Next goal" nudge shown on the win screen: the cheapest thing you don't own yet.
+function teaser() {
+  const items = BUS_SKINS.filter(k => !meta.owned.includes(k.id)).map(k => ({ n: k.name, p: k.price }))
+    .concat(WORKER_SKINS.filter(k => !meta.ownedLooks.includes(k.id)).map(k => ({ n: k.name, p: k.price })))
+    .sort((a, b) => a.p - b.p);
+  if (!items.length) return '';
+  const aff = items.filter(i => i.p <= meta.coins).pop();
+  if (aff) return `You can afford ${aff.n} in the shop!`;
+  return `Next unlock: ${items[0].n}, $${items[0].p - meta.coins} to go`;
+}
+const dayIndex = () => { const d = new Date(); return Math.floor((d.getTime() - d.getTimezoneOffset() * 60000) / 86400000); };
+const dailyLevel = day => 14 + (day * 7) % 22;   // rotates between shift-14 and shift-35 difficulty
+
+function startLevel(L, opts = {}) {
+  const daily = !!opts.daily;
+  const day = dayIndex();
+  const lvL = daily ? dailyLevel(day) : L;
+  const boss = !daily && isBoss(L);
+  const lv = genLevel(lvL, daily ? day * 104729 + 7 : null, boss || daily);
   S = {
-    level: L, grid: lv.grid, rows: lv.rows, cols: lv.cols,
+    level: L, lvL, daily, boss, opts, taps: 0, fog: fogFrom(lvL),
+    grid: lv.grid, rows: lv.rows, cols: lv.cols, solution: lv.order,
     bench: Array(lv.B).fill(null),
     buses: lv.seq.map((c, i) => ({ color: c, route: 10 + ((i * 37 + L * 11) % 89), assigned: 0, seated: 0, seats: [null, null, null], x: 470 + i * 140, s: .7, state: 'q', vx: 0, bob: Math.random() * 6, wheel: 0 })),
     people: [], parts: [], texts: [], losing: 0, over: false, won: 0, revived: false,
     score: 0, combo: 0, lastDepart: -9, panel: null, t: 0, hint: L === 1, flash: 0, flashCol: '255,255,255',
-    shake: 0, peak: 0, undo: [], mode: null, banner: 1.5, btnShake: [0, 0, 0], usedUndo: 0,
+    shake: 0, peak: 0, undo: [], mode: null, banner: boss || daily ? 2.2 : 1.5, btnShake: [0, 0, 0], usedUndo: 0,
   };
   S.total = lv.seq.length * 3;
   S.cell = Math.min(76, 396 / S.cols, GRID_H / S.rows);
@@ -264,14 +326,14 @@ function snapshot() {
     grid: S.grid.map(r => r.map(h => h && { ...h, shake: 0, reveal: 0 })),
     buses: S.buses.map(b => b.assigned),
     bench: S.bench.map(p => p && { color: p.color, skin: p.skin, hair: p.hair, bag: p.bag }),
-    score: S.score, peak: S.peak,
+    score: S.score, peak: S.peak, taps: S.taps,
   });
   if (S.undo.length > 15) S.undo.shift();
 }
 
 function doUndo() {
   const s = S.undo.pop();
-  S.grid = s.grid; S.score = s.score; S.peak = s.peak;
+  S.grid = s.grid; S.score = s.score; S.peak = s.peak; S.taps = s.taps;
   S.buses.forEach((b, i) => {
     const a = s.buses[i];
     b.assigned = a; b.seated = a;
@@ -316,11 +378,23 @@ function launch(r, c, viaCoffee) {
   }
   burst(cx, cy, PAL[h.color], 16, 190); burst(cx, cy, '#ffffff', 8, 110);
   ring(cx, cy, PAL[h.color]);
+  if (h.n === 6) { floatText(cx, cy - 26, '×6!', PAL[h.color], 26); ring(cx, cy, '#ffffff'); S.shake = Math.max(S.shake, 4); tone(300, .2, 'triangle', .14, 2.5, .05); }
   if (viaCoffee) { burst(cx, cy, '#8b5a2b', 14, 160); floatText(cx, cy - 20, '☕ Caffeinated!', '#ffd9a8', 16); sfx.coffee(); }
   sfx.pop(); buzz(12); S.shake = Math.max(S.shake, 2);
   if (Math.random() < .45) { const p = pick(crowd); S.texts.push({ follow: p, txt: pick(PHR), t: 1.8, max: 1.8, bubble: true }); }
+  S.taps++;
+  for (let rr2 = 0; rr2 < S.rows; rr2++) for (let cc = 0; cc < S.cols; cc++) {
+    const o = S.grid[rr2][cc];
+    if (o && o.lock && o.lock === S.taps) {
+      const [ux, uy] = cellCenter(rr2, cc);
+      o.reveal = 1; burst(ux, uy, '#ffd23f', 14, 150); ring(ux, uy, '#ffd23f');
+      floatText(ux, uy - 20, 'Meeting over!', '#ffd23f', 14);
+      tone(1100, .08, 'square', .05); tone(1500, .1, 'square', .05, 1, .07);
+    }
+  }
   refreshAccess(false);
 }
+const isLocked = h => h.lock && h.lock > S.taps;
 
 function revive() {
   S.revived = true;
@@ -395,7 +469,7 @@ function floatText(x, y, txt, col, size = 20) { S.texts.push({ x, y, txt, col, s
 // ---------- Update ----------
 function destPos(p) {
   const d = p.dest;
-  if (d.bus) { const b = d.bus; return [b.x + (40 + d.seat * 44) * b.s, BUSY - 60 * b.s + 24 * b.s]; }
+  if (d.bus) { const b = d.bus; return [b.x + (40 + d.seat * 44) * b.s, BUSY - skinById(meta.bus).h * b.s + 22 * b.s]; }
   if (d.slot !== undefined) return [benchX(d.slot), BENCH_Y];
   return [p.ox, 268];
 }
@@ -404,6 +478,15 @@ function showPanel(p) { p.t0 = S.t; S.panel = p; }
 
 function update(dt) {
   S.t += dt;
+  if (S.panel && S.panel.shop) {   // gameplay pauses while shopping; only effects keep moving
+    for (let i = S.parts.length - 1; i >= 0; i--) { const q = S.parts[i]; q.life -= dt; if (q.life <= 0) { S.parts.splice(i, 1); continue; } q.vy += q.g * dt; q.x += q.vx * dt; q.y += q.vy * dt; if (q.kind === 'conf') q.rot += q.vr * dt; }
+    for (let i = S.texts.length - 1; i >= 0; i--) { const t = S.texts[i]; t.t -= dt; if (t.t <= 0) S.texts.splice(i, 1); }
+    if (S.flash > 0) S.flash -= dt;
+    S.lastDepart += dt;
+    if (S.losing) S.losing += dt;
+    if (S.won) S.won += dt;
+    return;
+  }
   if (!S.panel && S.banner > 0) S.banner -= dt;
   // Buses
   const active = S.buses.filter(b => b.state !== 'leave' && b.state !== 'gone');
@@ -417,6 +500,10 @@ function update(dt) {
       continue;
     }
     const rank = active.indexOf(b);
+    const fogged = rank >= S.fog;
+    if (b.fog && !fogged && b.x < W) { b.reveal = 1; tone(760, .1, 'triangle', .07, 1.4); }
+    b.fog = fogged;
+    if (b.reveal > 0) b.reveal = Math.max(0, b.reveal - dt * 3);
     const tx = rank === 0 ? 24 : rank === 1 ? 236 : 236 + 128 * (rank - 1);
     const ts = rank === 0 ? 1 : .7;
     const k = Math.min(1, dt * 11);
@@ -432,6 +519,10 @@ function update(dt) {
       if (S.combo >= 2) {
         floatText(W / 2, 128, 'COMBO x' + S.combo + '!', PAL[(S.combo + 1) % PAL.length], 26 + Math.min(14, S.combo * 2));
         sfx.combo(S.combo); S.flash = .2; S.flashCol = '255,255,255'; S.shake = Math.min(9, 2 + S.combo * 1.5); buzz(25);
+      }
+      if (S.combo >= 5 && S.combo % 5 === 0) {   // every 5-chain pays out a couple of coins on the spot
+        const c = 3; meta.coins += c; saveMeta();
+        floatText(228, 62, `+$${c}`, '#ffd23f', 16); sfx.coin(S.combo);
       }
       confetti(b.x + 120, BUSY - 40, 10 + Math.min(20, S.combo * 4));
     }
@@ -483,7 +574,7 @@ function update(dt) {
     const btns = [];
     if (S.undo.length) btns.push({ label: meta.inv.undo > 0 ? `↶ Undo last tap (${meta.inv.undo} left)` : `↶ Undo last tap ($${BOOSTERS[0].price})`, fn: () => { if (consume(0)) doUndo(); }, primary: true });
     if (!S.revived) btns.push({ label: '🪑 Expense more chairs (free, 1×)', fn: revive, primary: !S.undo.length });
-    btns.push({ label: 'Retry shift', fn: () => startLevel(S.level) });
+    btns.push({ label: 'Retry shift', fn: () => startLevel(S.level, S.opts) });
     showPanel({ title: 'Break room overflow!', sub: 'HR has concerns. So does the fire marshal.', btns });
   }
   // Win
@@ -491,21 +582,41 @@ function update(dt) {
     S.won = S.t; sfx.win(); buzz(30); confetti(W / 2, 320, 80);
     let stars = S.peak <= .5 ? 3 : S.peak <= .8 ? 2 : 1;
     if (S.revived) stars = Math.min(stars, 2);
-    const earned = 10 + stars * 10 + Math.floor(S.score / 100);
-    const promoted = rankOf(S.level + 1) !== rankOf(S.level);
-    meta.coins += earned; meta.level = S.level + 1; meta.best = Math.max(meta.best, S.level);
-    let gift = null;
-    if (S.level % 3 === 0) { gift = pick(BOOSTERS); meta.inv[gift.id]++; }
+    let earned = 10 + stars * 10 + Math.min(30, Math.floor(S.score / 150));
+    let promoted = false, gift = null, streak = 0, perfect = S.peak === 0;
+    if (perfect) earned += 25;
+    if (S.daily) {
+      const d = meta.daily, today = dayIndex();
+      streak = d.last === today - 1 ? d.streak + 1 : d.last === today ? d.streak : 1;
+      earned = 60 + Math.min(streak, 7) * 15 + stars * 10;
+      meta.daily = { last: today, streak, best: Math.max(d.best || 0, streak) };
+      gift = pick(BOOSTERS); meta.inv[gift.id]++;
+    } else {
+      if (S.boss) earned *= 2;
+      promoted = rankOf(S.level + 1) !== rankOf(S.level);
+      if (promoted) earned += 100;
+      meta.level = S.level + 1; meta.best = Math.max(meta.best, S.level);
+      if (S.level % 3 === 0 || S.boss) { gift = pick(BOOSTERS); meta.inv[gift.id]++; }
+    }
+    meta.coins += earned;
     saveMeta();
-    S.pendingWin = { stars, earned, promoted, gift };
+    S.pendingWin = { stars, earned, promoted, gift, streak, perfect };
   }
   if (S.won && !S.panel && S.t - S.won > .9) {
     const w = S.pendingWin;
-    const sub = w.stars === 3 ? 'Flawless. Nobody even saw the break room.' : w.stars === 2 ? 'Solid shift. Mild break room congestion.' : 'Everyone got home… eventually.';
-    let extra = w.promoted ? `🎉 PROMOTED to ${rankOf(S.level + 1)}!` : '';
-    if (w.gift) extra += (extra ? '   ' : '') + `🎁 +1 ${w.gift.icon} ${w.gift.name}`;
-    showPanel({ title: 'Shift complete!', sub, stars: w.stars, coins: w.earned, extra,
-      btns: [{ label: `Next shift ▶`, fn: () => startLevel(S.level + 1), primary: true }] });
+    let sub = w.stars === 3 ? 'Flawless. Nobody even saw the break room.' : w.stars === 2 ? 'Solid shift. Mild break room congestion.' : 'Everyone got home… eventually.';
+    if (w.perfect) sub = 'PERFECT SHIFT! Break room untouched. +$25 bonus.';
+    let extra = '';
+    if (S.daily) extra = `🔥 Daily streak: ${w.streak} day${w.streak === 1 ? '' : 's'}`;
+    else if (w.promoted) extra = `🎉 PROMOTED to ${rankOf(S.level + 1)}! +$100`;
+    else if (S.boss) extra = '📈 Review passed: double pay!';
+    if (w.gift) extra += (extra ? '   ' : '') + `🎁 +1 ${w.gift.icon}`;
+    const btns = S.daily
+      ? [{ label: `Back to Shift ${meta.level} ▶`, fn: () => startLevel(meta.level), primary: true }, { label: 'Perks Shop', fn: openShop }]
+      : [{ label: `Next shift ▶`, fn: () => startLevel(S.level + 1), primary: true }, { label: 'Perks Shop', fn: openShop }];
+    if (!S.daily && dailyAvailable()) btns.splice(1, 0, { label: '🔥 Daily Shift (bonus pay)', fn: () => startLevel(meta.level, { daily: true }) });
+    showPanel({ title: S.daily ? 'Daily shift done!' : S.boss ? 'Review passed!' : 'Shift complete!', sub, stars: w.stars, coins: w.earned, extra, teaser: teaser(),
+      btns });
     for (let i = 0; i < w.stars; i++) sfx.star && setTimeout(() => sfx.star(i), 350 + i * 250);
   }
 }
@@ -591,6 +702,38 @@ function drawBackground() {
 }
 
 // ---------- Entities ----------
+// (x, y) = head center, r = head radius
+function drawAccessory(x, y, r, dir, col, kind, ph = 0) {
+  if (!kind || kind === 'none') return;
+  if (kind === 'cap') {
+    ctx.fillStyle = shade(col, -.3); ctx.beginPath(); ctx.arc(x, y - r * .15, r * 1.08, Math.PI, 0); ctx.fill();
+    ctx.fillRect(dir > 0 ? x : x - r * 1.7, y - r * .3, r * 1.7, r * .38);
+    circle(x, y - r * 1.2, r * .22, shade(col, .3));
+  } else if (kind === 'phones') {
+    ctx.strokeStyle = '#26202f'; ctx.lineWidth = r * .38; ctx.beginPath(); ctx.arc(x, y - r * .1, r * 1.08, Math.PI * 1.05, Math.PI * 1.95); ctx.stroke();
+    for (const sx of [-1, 1]) { circle(x + sx * r * 1.02, y + r * .1, r * .5, '#26202f'); circle(x + sx * r * 1.02, y + r * .1, r * .28, shade(col, .2)); }
+  } else if (kind === 'shades') {
+    ctx.fillStyle = '#111'; rr(x - r * .95 + dir * r * .2, y - r * .1, r * 1.9, r * .55, r * .2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,.7)'; ctx.fillRect(x - r * .55 + dir * r * .2, y - r * .02, r * .3, r * .15);
+  } else if (kind === 'party') {
+    const tip = [x + dir * r * .25, y - r * 2.6];
+    ctx.save(); ctx.beginPath(); ctx.moveTo(x - r * .75, y - r * .65); ctx.lineTo(x + r * .75, y - r * .65); ctx.lineTo(tip[0], tip[1]); ctx.closePath();
+    ctx.fillStyle = shade(col, .35); ctx.fill(); ctx.clip();
+    ctx.fillStyle = shade(col, -.25);
+    for (let i = 0; i < 4; i++) ctx.fillRect(x - r, y - r * (1 + i * .55), r * 2, r * .22);
+    ctx.restore();
+    circle(tip[0], tip[1], r * .32, '#fff');
+  } else if (kind === 'crown') {
+    const b = y - r * .55, t = y - r * 1.75;
+    ctx.fillStyle = '#ffd23f'; ctx.beginPath(); ctx.moveTo(x - r * .95, b);
+    ctx.lineTo(x - r * .95, t + r * .3); ctx.lineTo(x - r * .48, b - r * .55); ctx.lineTo(x, t); ctx.lineTo(x + r * .48, b - r * .55);
+    ctx.lineTo(x + r * .95, t + r * .3); ctx.lineTo(x + r * .95, b); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#b88a00'; ctx.lineWidth = Math.max(.6, r * .12); ctx.stroke();
+    circle(x, b - r * .3, r * .2, '#ff5a5f');
+    if (Math.sin(S.t * 4 + ph) > .8) circle(x + r * .5, t + r * .2, r * .18, '#fff');
+  }
+}
+
 function drawPerson(p) {
   const run = p.moving, sw = run ? Math.sin(p.phase) * 4.5 : 0, dir = p.dir || 1;
   let y = p.y - (run ? Math.abs(Math.sin(p.phase)) * 3 : 0) - p.hop * 7;
@@ -611,49 +754,162 @@ function drawPerson(p) {
   circle(x, y - 8, 5, p.skin);
   ctx.fillStyle = p.hair; ctx.beginPath(); ctx.arc(x, y - 8.6, 5.3, Math.PI * 1.02, Math.PI * 1.98); ctx.fill();
   circle(x - 1.6 + dir * 1.2, y - 7.6, .9, '#1b1424'); circle(x + 1.6 + dir * 1.2, y - 7.6, .9, '#1b1424');
+  drawAccessory(x, y - 8, 5, dir, col, p.look || meta.look, p.phase);
   if (p.dest && p.dest.overflow && p.arrived) otxt('!', x, y - 20 + Math.sin(S.t * 12) * 1.5, 15, '#ff4b4b', '#fff', 3);
 }
 
-function drawBus(b) {
-  if (b.state === 'gone' || b.x > W + 10 || b.x < -260) return;
-  const s = b.s, x = b.x, w = 170 * s, h = 60 * s;
-  const bob = (b.state === 'leave' ? Math.sin(b.bob * 2) * 1.5 : Math.sin(b.bob) * .6);
-  const top = BUSY - h + bob;
-  const col = PAL[b.color];
-  ctx.fillStyle = 'rgba(0,0,0,.3)'; ctx.beginPath(); ctx.ellipse(x + w / 2, BUSY + 7, w / 2, 5 * s, 0, 0, Math.PI * 2); ctx.fill();
-  // roof sign
-  ctx.fillStyle = '#1f1830'; rr(x + w * .3, top - 9 * s, w * .4, 11 * s, 3 * s); ctx.fill();
-  txt(`${b.route} HOME`, x + w / 2, top - 3.5 * s, 7.5 * s, '#ffd23f', 'center', 900);
-  // body
-  const bg = ctx.createLinearGradient(0, top, 0, top + h);
-  bg.addColorStop(0, shade(col, .25)); bg.addColorStop(.5, col); bg.addColorStop(1, shade(col, -.2));
-  ctx.fillStyle = bg; rr(x, top, w, h, 14 * s); ctx.fill();
-  ctx.fillStyle = shade(col, -.35); ctx.fillRect(x + 4 * s, top + h - 17 * s, w - 8 * s, 6 * s);
-  ctx.fillStyle = 'rgba(255,255,255,.5)'; rr(x + 8 * s, top + 3 * s, w - 16 * s, 3 * s, 2 * s); ctx.fill();
-  // windshield
-  ctx.fillStyle = '#d7f1ff'; rr(x + 6 * s, top + 9 * s, 16 * s, 30 * s, 5 * s); ctx.fill();
-  ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.fillRect(x + 9 * s, top + 12 * s, 3 * s, 20 * s);
-  // seat windows
+function bodyGrad(top, h, col, lo = -.2, hi = .25) {
+  const g = ctx.createLinearGradient(0, top, 0, top + h);
+  g.addColorStop(0, shade(col, hi)); g.addColorStop(.5, col); g.addColorStop(1, shade(col, lo));
+  return g;
+}
+function wheel(wx, wy, s, ang) {
+  circle(wx, wy, 11 * s, '#1c1726'); circle(wx, wy, 5 * s, '#a8a1bd');
+  ctx.strokeStyle = '#5d5670'; ctx.lineWidth = 1.5 * s;
+  for (let k = 0; k < 3; k++) { const a = ang + k * 2.09; ctx.beginPath(); ctx.moveTo(wx, wy); ctx.lineTo(wx + Math.cos(a) * 8 * s, wy + Math.sin(a) * 8 * s); ctx.stroke(); }
+}
+function windshield(x, top, s, h = 30) {
+  ctx.fillStyle = '#d7f1ff'; rr(x + 6 * s, top + 9 * s, 16 * s, h * s, 5 * s); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.fillRect(x + 9 * s, top + 12 * s, 3 * s, (h - 10) * s);
+}
+
+// Draws a shuttle. `by` = ground line, `skinId` lets the shop preview any skin.
+function drawBus(b, by = BUSY, skinId = meta.bus) {
+  if (b.state === 'gone' || b.x > W + 10 || b.x < -300) return;
+  const sk = skinById(skinId), id = sk.id;
+  const s = b.s, x = b.x, w = (id === 'limo' ? 196 : 170) * s, h = sk.h * s;
+  const leaving = b.state === 'leave';
+  let bob = leaving ? Math.sin(b.bob * 2) * 1.5 : Math.sin(b.bob) * .6;
+  if (id === 'rocket') bob = Math.sin(b.bob * .7) * 2.5 * s - 4 * s;
+  const top = by - h + bob;
+  const col = b.fog ? '#4a4363' : PAL[b.color], T = S.t;
+  ctx.fillStyle = 'rgba(0,0,0,.3)'; ctx.beginPath(); ctx.ellipse(x + w / 2, by + 7, w / 2, 5 * s, 0, 0, Math.PI * 2); ctx.fill();
+  let winStyle = 'rect';
+
+  if (id === 'classic') {
+    ctx.fillStyle = '#1f1830'; rr(x + w * .3, top - 9 * s, w * .4, 11 * s, 3 * s); ctx.fill();
+    txt(`${b.route} HOME`, x + w / 2, top - 3.5 * s, 7.5 * s, '#ffd23f', 'center', 900);
+    ctx.fillStyle = bodyGrad(top, h, col); rr(x, top, w, h, 14 * s); ctx.fill();
+    ctx.fillStyle = shade(col, -.35); ctx.fillRect(x + 4 * s, top + h - 17 * s, w - 8 * s, 6 * s);
+    ctx.fillStyle = 'rgba(255,255,255,.5)'; rr(x + 8 * s, top + 3 * s, w - 16 * s, 3 * s, 2 * s); ctx.fill();
+    windshield(x, top, s);
+  } else if (id === 'decker') {
+    const ut = top - 32 * s;
+    ctx.fillStyle = bodyGrad(ut, h + 32 * s, col); rr(x, ut, w, h + 32 * s, 14 * s); ctx.fill();
+    ctx.fillStyle = shade(col, -.3); ctx.fillRect(x + 2 * s, top - 4 * s, w - 4 * s, 4 * s);
+    for (let i = 0; i < 4; i++) {
+      ctx.fillStyle = '#2d3a5c'; rr(x + (26 + i * 34) * s, ut + 7 * s, 28 * s, 18 * s, 4 * s); ctx.fill();
+      if ((i + b.route) % 3 === 0) { circle(x + (40 + i * 34) * s, ut + 19 * s, 4.5 * s, 'rgba(255,224,189,.55)'); }
+      ctx.fillStyle = 'rgba(255,255,255,.25)'; ctx.fillRect(x + (28 + i * 34) * s, ut + 9 * s, 3 * s, 12 * s);
+    }
+    ctx.fillStyle = '#d7f1ff'; rr(x + 5 * s, ut + 7 * s, 15 * s, 18 * s, 4 * s); ctx.fill();
+    ctx.fillStyle = '#1f1830'; rr(x + 4 * s, top + 4 * s, 18 * s, 5 * s, 2 * s); ctx.fill();
+    txt(String(b.route), x + 13 * s, top + 6.5 * s, 5 * s, '#ffd23f', 'center', 900);
+    ctx.fillStyle = shade(col, -.35); ctx.fillRect(x + 4 * s, top + h - 17 * s, w - 8 * s, 6 * s);
+    ctx.fillStyle = 'rgba(255,255,255,.5)'; rr(x + 8 * s, ut + 3 * s, w - 16 * s, 3 * s, 2 * s); ctx.fill();
+    windshield(x, top + 2 * s, s, 28);
+  } else if (id === 'camper') {
+    // surfboard + rack
+    ctx.strokeStyle = '#3a3050'; ctx.lineWidth = 2 * s;
+    for (const rx of [x + 45 * s, x + w - 45 * s]) { ctx.beginPath(); ctx.moveTo(rx, top + 2 * s); ctx.lineTo(rx, top - 5 * s); ctx.stroke(); }
+    ctx.fillStyle = shade(col, .55); ctx.beginPath(); ctx.ellipse(x + w / 2, top - 7 * s, w * .44, 5 * s, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = shade(col, -.2); ctx.fillRect(x + w * .1, top - 8 * s, w * .8, 2 * s);
+    ctx.save(); rr(x, top, w, h, 24 * s); ctx.clip();
+    ctx.fillStyle = bodyGrad(top, h, col); ctx.fillRect(x, top, w, h);
+    ctx.fillStyle = '#fff4dc'; ctx.fillRect(x, top, w, h * .55);
+    ctx.fillStyle = '#fff4dc'; ctx.beginPath(); ctx.moveTo(x, top + h * .5); ctx.lineTo(x + 26 * s, top + h * .5); ctx.lineTo(x + 4 * s, top + h * .92); ctx.lineTo(x, top + h * .92); ctx.fill();
+    ctx.fillStyle = 'rgba(0,0,0,.12)'; ctx.fillRect(x, top + h * .55, w, 2 * s);
+    ctx.restore();
+    windshield(x, top, s, 26);
+    circle(x + 12 * s, top + h * .72, 5 * s, '#fff6b0'); circle(x + 12 * s, top + h * .72, 5 * s * .5, '#fff');
+    ctx.strokeStyle = '#fff4dc'; ctx.lineWidth = 2 * s; ctx.beginPath(); ctx.arc(x + w - 22 * s, top + h * .74, 6 * s, 0, 7); ctx.stroke();
+    txt('☮', x + w - 22 * s, top + h * .74 + .5 * s, 9 * s, '#fff4dc', 'center', 900);
+  } else if (id === 'limo') {
+    ctx.fillStyle = bodyGrad(top, h, shade(col, -.15), -.45, .35); rr(x, top + 6 * s, w, h - 6 * s, 12 * s); ctx.fill();
+    ctx.fillStyle = bodyGrad(top, h * .6, shade(col, -.1), -.3, .3); rr(x + 22 * s, top, w - 40 * s, h * .55, 10 * s); ctx.fill();
+    ctx.fillStyle = '#e9e9f3'; ctx.fillRect(x + 4 * s, top + h - 14 * s, w - 8 * s, 2.5 * s);
+    ctx.fillStyle = 'rgba(255,255,255,.55)'; rr(x + 26 * s, top + 2 * s, w - 48 * s, 2.5 * s, 1 * s); ctx.fill();
+    ctx.fillStyle = '#20243a'; rr(x + 8 * s, top + 9 * s, 14 * s, 18 * s, 4 * s); ctx.fill();
+    circle(x + 3 * s, top + 4 * s, 2 * s, '#e9e9f3');
+    ctx.fillStyle = '#fff'; rr(x + w - 22 * s, top + h - 22 * s, 16 * s, 7 * s, 2 * s); ctx.fill();
+    txt('VIP', x + w - 14 * s, top + h - 18.3 * s, 5 * s, '#222', 'center', 900);
+    winStyle = 'tint';
+  } else if (id === 'party') {
+    // disco ball + roof lights
+    ctx.strokeStyle = '#ccc'; ctx.lineWidth = 1 * s; ctx.beginPath(); ctx.moveTo(x + w / 2, top); ctx.lineTo(x + w / 2, top - 6 * s); ctx.stroke();
+    circle(x + w / 2, top - 12 * s, 7 * s, '#cfd3e6');
+    for (let i = 0; i < 6; i++) { const a = T * 3 + i; circle(x + w / 2 + Math.cos(a) * 4 * s, top - 12 * s + Math.sin(a * 1.3) * 4 * s, 1.5 * s, PAL[i % PAL.length]); }
+    for (let i = 0; i < 7; i++) { const on = Math.floor(T * 6 + i) % 2; circle(x + (20 + i * 22) * s, top - 1 * s, 2.6 * s, on ? PAL[(i + Math.floor(T * 4)) % PAL.length] : '#3a3050'); }
+    ctx.fillStyle = bodyGrad(top, h, col); rr(x, top, w, h, 14 * s); ctx.fill();
+    ctx.save(); rr(x, top, w, h, 14 * s); ctx.clip();
+    for (let i = 0; i < 12; i++) { ctx.fillStyle = PAL[(i + Math.floor(T * 8)) % PAL.length]; ctx.fillRect(x + i * 15 * s, top + h - 17 * s, 15 * s, 6 * s); }
+    ctx.fillStyle = 'rgba(255,255,255,.18)';
+    for (let i = 0; i < 9; i++) circle(x + (14 + i * 19) * s, top + h - 5 * s, 2 * s, 'rgba(255,255,255,.25)');
+    ctx.restore();
+    windshield(x, top, s);
+    for (let i = 0; i < 2; i++) {
+      const k = (T * .8 + i * .5) % 1;
+      ctx.globalAlpha = 1 - k; txt('♪', x + w * (.35 + i * .35) + Math.sin(T * 4 + i) * 4 * s, top - 14 * s - k * 22 * s, 11 * s, PAL[(i * 3 + b.color) % PAL.length], 'center', 900); ctx.globalAlpha = 1;
+    }
+  } else if (id === 'rocket') {
+    // flame from the rear
+    const fl = (leaving ? 46 : 14 + Math.sin(T * 30) * 4) * s;
+    const fg = ctx.createLinearGradient(x + w - 6 * s, 0, x + w + fl, 0);
+    fg.addColorStop(0, '#fff6b0'); fg.addColorStop(.4, '#ffb03a'); fg.addColorStop(1, 'rgba(255,80,60,0)');
+    ctx.fillStyle = fg; ctx.beginPath(); ctx.moveTo(x + w - 6 * s, top + h * .3); ctx.quadraticCurveTo(x + w + fl, top + h * .5, x + w - 6 * s, top + h * .7); ctx.fill();
+    // fins
+    ctx.fillStyle = shade(col, -.35);
+    ctx.beginPath(); ctx.moveTo(x + w - 46 * s, top + 4 * s); ctx.lineTo(x + w - 4 * s, top - 16 * s); ctx.lineTo(x + w - 6 * s, top + 14 * s); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(x + w - 46 * s, top + h - 4 * s); ctx.lineTo(x + w - 4 * s, top + h + 12 * s); ctx.lineTo(x + w - 6 * s, top + h - 14 * s); ctx.fill();
+    // body + nose cone
+    ctx.fillStyle = bodyGrad(top, h, col, -.3, .4);
+    ctx.beginPath(); ctx.moveTo(x + 24 * s, top); ctx.lineTo(x + w - 14 * s, top); ctx.quadraticCurveTo(x + w, top, x + w, top + 14 * s);
+    ctx.lineTo(x + w, top + h - 14 * s); ctx.quadraticCurveTo(x + w, top + h, x + w - 14 * s, top + h); ctx.lineTo(x + 24 * s, top + h);
+    ctx.quadraticCurveTo(x - 10 * s, top + h / 2, x + 24 * s, top); ctx.fill();
+    ctx.fillStyle = '#e9e9f3'; ctx.fillRect(x + 22 * s, top + h - 12 * s, w - 30 * s, 3 * s);
+    ctx.fillStyle = 'rgba(255,255,255,.45)'; rr(x + 26 * s, top + 3 * s, w - 44 * s, 3 * s, 1.5 * s); ctx.fill();
+    // hover glow instead of wheels
+    const hg = ctx.createRadialGradient(x + w / 2, by + 2, 2, x + w / 2, by + 2, w / 2);
+    hg.addColorStop(0, 'rgba(140,220,255,.55)'); hg.addColorStop(1, 'rgba(140,220,255,0)');
+    ctx.fillStyle = hg; ctx.fillRect(x, by - 8, w, 18);
+    winStyle = 'round';
+  }
+
+  // seat windows (shared positions so passengers always land in the right spot)
   for (let i = 0; i < 3; i++) {
-    const wx = x + (40 + i * 44 - 17) * s, wy = top + 10 * s, ww = 34 * s, wh = 25 * s;
+    const cxw = x + (40 + i * 44) * s, wy = top + 10 * s, ww = 34 * s, wh = 25 * s, wx = cxw - 17 * s;
     const assignedEmpty = i < b.assigned && !b.seats[i];
-    ctx.fillStyle = assignedEmpty ? `rgba(255,246,190,${.75 + .25 * Math.sin(S.t * 10)})` : '#92c8e6'; rr(wx, wy, ww, wh, 5 * s); ctx.fill();
+    const shape = () => { if (winStyle === 'round') { ctx.beginPath(); ctx.arc(cxw, wy + 12.5 * s, 13 * s, 0, 7); } else rr(wx, wy, ww, winStyle === 'tint' ? 20 * s : wh, 5 * s); };
+    if (winStyle === 'round') circle(cxw, wy + 12.5 * s, 15.5 * s, '#e9e9f3');
+    shape();
+    ctx.fillStyle = assignedEmpty ? `rgba(255,246,190,${.75 + .25 * Math.sin(T * 10)})` : winStyle === 'tint' ? '#2b2f48' : '#92c8e6';
+    ctx.fill();
     const st = b.seats[i];
     if (st) {
-      const pop = st.pop || 0, bounce = Math.sin(S.t * 6 + i * 2) * .8 * s;
-      ctx.save(); rr(wx, wy, ww, wh, 5 * s); ctx.clip();
+      const pop = st.pop || 0, bounce = Math.sin(T * (id === 'party' ? 12 : 6) + i * 2) * (id === 'party' ? 2 : .8) * s;
+      ctx.save(); shape(); ctx.clip();
+      if (winStyle === 'tint') ctx.globalAlpha = .8;
       ctx.fillStyle = PAL[st.color]; rr(wx + 9 * s, wy + 15 * s + bounce, 16 * s, 12 * s, 5 * s); ctx.fill();
-      circle(wx + 17 * s, wy + 11 * s + bounce - pop * 4, 6 * s * (1 + pop * .3), st.skin);
-      ctx.fillStyle = st.hair; ctx.beginPath(); ctx.arc(wx + 17 * s, wy + 10 * s + bounce - pop * 4, 6.3 * s, Math.PI * 1.02, Math.PI * 1.98); ctx.fill();
-      ctx.restore();
+      circle(cxw, wy + 11 * s + bounce - pop * 4, 6 * s * (1 + pop * .3), st.skin);
+      ctx.fillStyle = st.hair; ctx.beginPath(); ctx.arc(cxw, wy + 10 * s + bounce - pop * 4, 6.3 * s, Math.PI * 1.02, Math.PI * 1.98); ctx.fill();
+      if (id === 'limo' && (b.look || meta.look) !== 'shades') { ctx.fillStyle = '#111'; ctx.fillRect(cxw - 5 * s, wy + 10 * s + bounce - pop * 4, 10 * s, 2.2 * s); } // sunglasses
+      ctx.restore(); ctx.globalAlpha = 1;
+      drawAccessory(cxw, wy + 11 * s + bounce - pop * 4, 6 * s, 1, PAL[st.color], b.look || meta.look, i);
     }
-    ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.fillRect(wx + 3 * s, wy + 3 * s, 3 * s, wh - 8 * s);
+    ctx.fillStyle = 'rgba(255,255,255,.35)';
+    if (winStyle === 'round') { ctx.beginPath(); ctx.arc(cxw - 4 * s, wy + 8 * s, 3 * s, 0, 7); ctx.fill(); }
+    else ctx.fillRect(wx + 3 * s, wy + 3 * s, 3 * s, (winStyle === 'tint' ? 14 : wh / s - 8) * s);
   }
-  circle(x + 4 * s, top + h - 13 * s, 3.5 * s, '#fff6b0');
-  for (const wx of [x + 34 * s, x + w - 34 * s]) {
-    circle(wx, BUSY + 1, 11 * s, '#1c1726'); circle(wx, BUSY + 1, 5 * s, '#a8a1bd');
-    ctx.strokeStyle = '#5d5670'; ctx.lineWidth = 1.5 * s;
-    for (let k = 0; k < 3; k++) { const a = b.wheel + k * 2.09; ctx.beginPath(); ctx.moveTo(wx, BUSY + 1); ctx.lineTo(wx + Math.cos(a) * 8 * s, BUSY + 1 + Math.sin(a) * 8 * s); ctx.stroke(); }
+  if (id !== 'rocket') {
+    if (id !== 'camper') circle(x + 4 * s, top + h - 13 * s, 3.5 * s, '#fff6b0');
+    const inset = id === 'limo' ? 30 : 34;
+    for (const wx of [x + inset * s, x + w - inset * s]) wheel(wx, by + 1, s, b.wheel);
+  }
+  if (b.fog) {
+    ctx.fillStyle = 'rgba(20,12,40,.45)'; rr(x, top, w, h, 14 * s); ctx.fill();
+    otxt('?', x + w / 2, top + h * .45, 30 * s, '#d8d2ee', 'rgba(20,10,40,.7)', 4 * s);
+  } else if (b.reveal > 0) {
+    ctx.globalAlpha = b.reveal; ctx.fillStyle = '#fff'; rr(x, top, w, h, 14 * s); ctx.fill(); ctx.globalAlpha = 1;
   }
 }
 
@@ -686,8 +942,14 @@ function drawHouse(r, c, h, front) {
   const sh = h.shake > 0 ? Math.sin(h.shake * 60) * 5 * h.shake / .3 : 0;
   const match = acc && !h.mystery && front && front.color === h.color;
   const col = h.mystery ? '#8a83a0' : PAL[h.color];
+  const big = h.n === 6 && !h.mystery;
   ctx.save(); ctx.translate(cx + sh, cy - lift); ctx.scale(sc, sc);
   ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(-sz / 2 + 1, -sz / 2 + depth + lift + 2, sz, sz, rad); ctx.fill();
+  if (big) {
+    // stacked "second floor" peeking out above — reads as a double-size crowd
+    ctx.fillStyle = acc ? shade(col, -.25) : shade(col, -.65); rr(-sz / 2 + 4, -sz / 2 - 7, sz - 8, sz, rad); ctx.fill();
+    ctx.fillStyle = acc ? shade(col, .1) : shade(col, -.5); rr(-sz / 2 + 4, -sz / 2 - 9, sz - 8, 6, 3); ctx.fill();
+  }
   ctx.fillStyle = acc ? shade(col, -.4) : '#2f2848'; rr(-sz / 2, -sz / 2 + depth, sz, sz, rad); ctx.fill();
   const face = ctx.createLinearGradient(0, -sz / 2, 0, sz / 2);
   if (acc) { face.addColorStop(0, '#ffffff'); face.addColorStop(1, '#e6def5'); }
@@ -712,13 +974,36 @@ function drawHouse(r, c, h, front) {
     const dw = sz * .3, dh = sz * .3;
     ctx.fillStyle = acc ? shade(col, -.1) : shade(col, -.6); rr(-dw / 2, sz / 2 - dh - sz * .05, dw, dh, 4); ctx.fill();
     circle(dw * .25, sz / 2 - dh * .5 - sz * .05, 1.8, acc ? '#fff' : '#555');
-    if (n === 6) { ctx.fillStyle = acc ? '#2a2342' : 'rgba(0,0,0,.4)'; rr(sz / 2 - 18, -sz / 2 + 2, 16, 11, 5); ctx.fill(); txt('×6', sz / 2 - 10, -sz / 2 + 8, 8, '#fff', 'center', 900); }
   }
-  if (match) {
+  if (big) {
+    const br = Math.max(11.5, sz * .23) * (acc ? 1 + .08 * Math.sin(S.t * 6 + r + c) : 1);
+    const bx = sz / 2 - br * .45, by = -sz / 2 + br * .2;
+    circle(bx, by + 2, br, 'rgba(0,0,0,.35)');
+    circle(bx, by, br, '#fff');
+    circle(bx, by, br - 2.5, acc ? col : shade(col, -.45));
+    otxt('6', bx, by + 1, br * 1.25, '#fff', 'rgba(20,10,40,.55)', 3);
+  }
+  const locked = isLocked(h);
+  if (locked) {
+    // "Meeting in progress": tinted glass + padlock + taps remaining
+    ctx.fillStyle = 'rgba(30,18,60,.55)'; rr(-sz / 2, -sz / 2, sz, sz, rad); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 1.5;
+    for (let i = -2; i <= 2; i++) { ctx.beginPath(); ctx.moveTo(i * sz * .2 - sz * .1, -sz / 2); ctx.lineTo(i * sz * .2 + sz * .1, sz / 2); ctx.stroke(); }
+    const ls = Math.max(.75, sz / 62), wob = Math.sin(S.t * 3 + r + c) * .06;
+    ctx.save(); ctx.translate(0, -sz * .06); ctx.rotate(wob); ctx.scale(ls, ls);
+    ctx.strokeStyle = '#d9a400'; ctx.lineWidth = 3.2; ctx.beginPath(); ctx.arc(0, -4, 5.5, Math.PI, 0); ctx.stroke();
+    ctx.fillStyle = '#ffd23f'; rr(-9, -4, 18, 14, 3); ctx.fill();
+    circle(0, 2, 2.2, '#8a6400'); ctx.fillStyle = '#8a6400'; ctx.fillRect(-.8, 2, 1.6, 4);
+    ctx.restore();
+    const n = h.lock - S.taps, pw2 = 30;
+    ctx.fillStyle = '#ffd23f'; rr(-pw2 / 2, sz * .2, pw2, 15, 7.5); ctx.fill();
+    txt(`${n} tap${n === 1 ? '' : 's'}`, 0, sz * .2 + 8, 8.5, '#3a2600', 'center', 900);
+  }
+  if (match && !locked) {
     ctx.strokeStyle = col; ctx.lineWidth = 3.5; ctx.globalAlpha = .55 + .45 * Math.sin(S.t * 7);
     rr(-sz / 2 - 3, -sz / 2 - 3, sz + 6, sz + 6, rad + 3); ctx.stroke(); ctx.globalAlpha = 1;
   } else if (acc) { ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineWidth = 2; rr(-sz / 2, -sz / 2, sz, sz, rad); ctx.stroke(); }
-  if (coffee && !acc) {
+  if (coffee && !acc && !locked) {
     ctx.strokeStyle = `rgba(255,200,130,${.5 + .5 * Math.sin(S.t * 8)})`; ctx.lineWidth = 3; ctx.setLineDash([5, 4]);
     rr(-sz / 2, -sz / 2, sz, sz, rad); ctx.stroke(); ctx.setLineDash([]);
   }
@@ -755,11 +1040,13 @@ function button(x, y, w, h, label, primary, size = 16) {
 
 function drawHUD() {
   ctx.fillStyle = 'rgba(20,12,40,.45)'; ctx.fillRect(0, 0, W, 50);
-  otxt(`SHIFT ${S.level}`, 14, 19, 19, '#fff', 'rgba(20,10,40,.6)', 3, 'left');
-  txt(rankOf(S.level).toUpperCase(), 15, 38, 9.5, '#ffd9a8', 'left', 900);
-  txt(`★ ${S.score}`, 200, 25, 17, '#fff3c4', 'center', 900);
-  ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(240, 11, 76, 28, 14); ctx.fill();
-  circle(257, 25, 8, "#e0a800"); circle(257, 24, 7, "#ffd23f"); txt("$", 257, 24.5, 9, "#9a6b00", "center", 900); txt(String(meta.coins), 270, 26, 14, "#ffd23f", "left", 900);
+  otxt(S.daily ? 'DAILY' : `SHIFT ${S.level}`, 14, 19, S.daily ? 18 : 19, S.daily ? '#ffb070' : S.boss ? '#ff8a95' : '#fff', 'rgba(20,10,40,.6)', 3, 'left');
+  txt(S.daily ? `🔥 STREAK ${meta.daily.last === dayIndex() - 1 || meta.daily.last === dayIndex() ? meta.daily.streak : 0}` : S.boss ? '⚠ PERFORMANCE REVIEW' : rankOf(S.level).toUpperCase(), 15, 38, 9.5, '#ffd9a8', 'left', 900);
+  txt(`★ ${S.score}`, 156, 25, 16, '#fff3c4', 'center', 900);
+  ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(192, 11, 72, 28, 14); ctx.fill();
+  coinIcon(208, 25, 8); txt(String(meta.coins), 221, 26, 14, '#ffd23f', 'left', 900);
+  button(270, 9, 58, 32, 'SHOP', true, 12);
+  if (canBuyAnything()) circle(324, 11, 5 + Math.sin(S.t * 6) * 1, '#ff5a5f');
   button(W - 46, 9, 36, 32, '⟲', false, 17);
   button(W - 88, 9, 36, 32, muted ? '🔇' : '🔊', false, 14);
   // progress
@@ -809,11 +1096,113 @@ function wrapLines(s, maxW, size) {
   lines.push(line); return lines;
 }
 
+function coinIcon(x, y, r) {
+  circle(x, y + 1, r, '#c78f00'); circle(x, y, r, '#ffd23f'); circle(x, y, r * .7, '#ffe27a');
+  txt('$', x, y + .5, r * 1.15, '#a56f00', 'center', 900);
+}
+
+function openShop() {
+  if (S.losing) return;
+  const back = S.panel;
+  showPanel({ shop: true, tab: 'bus', back });
+  tone(700, .08, 'triangle', .1, 1.4);
+}
+function closeShop() {
+  const P = S.panel;
+  S.panel = P.back || null;
+  if (S.panel) S.panel.t0 = S.t - 1;
+}
+const shopTab = tab => tab === 'people'
+  ? { items: WORKER_SKINS, owned: meta.ownedLooks, cur: meta.look, set: id => { meta.look = id; } }
+  : { items: BUS_SKINS, owned: meta.owned, cur: meta.bus, set: id => { meta.bus = id; } };
+const canBuyAnything = () => ['bus', 'people'].some(t => { const T = shopTab(t); return T.items.some(k => !T.owned.includes(k.id) && meta.coins >= k.price); });
+
+function buySkin(k, cx, cy, tab = 'bus') {
+  const T = shopTab(tab);
+  if (T.owned.includes(k.id)) { T.set(k.id); saveMeta(); sfx.chair(); return; }
+  if (meta.coins < k.price) { S.panel.deny = { id: k.id, t: S.t }; sfx.nope(); return; }
+  meta.coins -= k.price; T.owned.push(k.id); T.set(k.id); saveMeta();
+  confetti(cx, cy, 40); sfx.win(); S.flash = .25; S.flashCol = '255,230,150';
+  floatText(cx, cy - 30, 'UNLOCKED!', '#ffd23f', 24);
+}
+
+function drawShop(P, el) {
+  const pop = easeBack(el * 4);
+  ctx.save(); ctx.translate(W / 2, H / 2); ctx.scale(pop, pop); ctx.translate(-W / 2, -H / 2);
+  const px = 12, py = 58, pw = W - 24, ph = 656;
+  ctx.fillStyle = 'rgba(0,0,0,.4)'; rr(px, py + 8, pw, ph, 24); ctx.fill();
+  const g = ctx.createLinearGradient(0, py, 0, py + ph); g.addColorStop(0, '#4b3d7d'); g.addColorStop(1, '#251d45');
+  ctx.fillStyle = g; rr(px, py, pw, ph, 24); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.18)'; ctx.lineWidth = 2; ctx.stroke();
+  P.rects = [];
+  otxt('PERKS SHOP', px + 22, py + 32, 24, '#fff', 'rgba(20,10,40,.7)', 5, 'left');
+  ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(px + pw - 152, py + 18, 80, 28, 14); ctx.fill();
+  coinIcon(px + pw - 136, py + 32, 8); txt(String(meta.coins), px + pw - 123, py + 33, 14, '#ffd23f', 'left', 900);
+  const cb = { x: px + pw - 60, y: py + 14, w: 42, h: 36, fn: closeShop };
+  button(cb.x, cb.y, cb.w, cb.h, '✕', false, 18); P.rects.push(cb);
+  // tabs
+  const tabs = [['bus', 'Shuttles'], ['people', 'Workers']];
+  tabs.forEach(([id, label], i) => {
+    const r = { x: px + 18 + i * 120, y: py + 60, w: 112, h: 30, fn: () => { P.tab = id; } };
+    const on = P.tab === id;
+    ctx.fillStyle = on ? '#ffd23f' : 'rgba(255,255,255,.1)'; rr(r.x, r.y, r.w, r.h, 15); ctx.fill();
+    txt(label, r.x + r.w / 2, r.y + 16, 13, on ? '#3a2600' : 'rgba(255,255,255,.8)', 'center', 900);
+    const T2 = shopTab(id);
+    if (!on && T2.items.some(k => !T2.owned.includes(k.id) && meta.coins >= k.price)) circle(r.x + r.w - 6, r.y + 4, 5, '#ff5a5f');
+    P.rects.push(r);
+  });
+  // cards
+  const T = shopTab(P.tab);
+  const cw = (pw - 48) / 2, ch = 164;
+  T.items.forEach((k, i) => {
+    const cx = px + 18 + (i % 2) * (cw + 12), cy = py + 102 + Math.floor(i / 2) * (ch + 8);
+    const owned = T.owned.includes(k.id), equipped = T.cur === k.id, afford = meta.coins >= k.price;
+    ctx.fillStyle = equipped ? 'rgba(53,208,127,.22)' : 'rgba(0,0,0,.28)'; rr(cx, cy, cw, ch, 16); ctx.fill();
+    ctx.strokeStyle = equipped ? '#35d07f' : 'rgba(255,255,255,.1)'; ctx.lineWidth = equipped ? 2.5 : 1.5; ctx.stroke();
+    // preview: cycles colors so you see the skin across routes
+    const ci = (Math.floor(S.t / 1.4) + i) % PAL.length;
+    const sc = .56, bw = (k.id === 'limo' ? 196 : 170) * sc;
+    const fake = { x: cx + (cw - bw) / 2 - (k.id === 'rocket' ? 6 : 0), s: sc, color: ci, route: 17 + i * 7, state: 'q', bob: S.t * 8 + i, wheel: S.t * 3, assigned: 3,
+      seats: [0, 1, 2].map(j => ({ skin: SKIN[(i + j) % SKIN.length], hair: HAIR[(i * 2 + j) % HAIR.length], color: ci })) };
+    ctx.save(); rr(cx, cy, cw, ch, 16); ctx.clip();
+    if (P.tab === 'people') {
+      ctx.translate(cx + cw / 2, cy + 64); ctx.scale(2.4, 2.4);
+      for (let j = 0; j < 3; j++) {
+        drawPerson({ x: (j - 1) * 15, y: j === 1 ? -2 : 2, color: (ci + j * 2) % PAL.length, skin: SKIN[(i + j * 2) % SKIN.length], hair: HAIR[(i * 3 + j) % HAIR.length],
+          bag: j === 2, path: [], moving: true, phase: S.t * 9 + j * 2, hop: 0, dir: j === 0 ? 1 : -1, look: k.id, fly: false, delay: 0 });
+      }
+    } else drawBus(fake, cy + 86, k.id);
+    ctx.restore();
+    txt(k.name, cx + cw / 2, cy + 106, 14, '#fff', 'center', 900);
+    txt(k.desc, cx + cw / 2, cy + 123, 10, 'rgba(255,255,255,.6)', 'center', 600);
+    const tab = P.tab;
+    const br = { x: cx + 14, y: cy + 134, w: cw - 28, h: 26, fn: () => buySkin(k, cx + cw / 2, cy + 60, tab) };
+    let shake = 0;
+    if (P.deny && P.deny.id === k.id && S.t - P.deny.t < .35) shake = Math.sin((S.t - P.deny.t) * 70) * 4;
+    br.x += shake;
+    if (equipped) { ctx.fillStyle = '#35d07f'; rr(br.x, br.y, br.w, br.h, 13); ctx.fill(); txt('✓ Equipped', br.x + br.w / 2, br.y + 14, 12, '#fff', 'center', 900); }
+    else if (owned) button(br.x, br.y, br.w, br.h, 'Equip', false, 12);
+    else {
+      ctx.globalAlpha = afford ? 1 : .55;
+      button(br.x, br.y, br.w, br.h, '', afford, 12);
+      ctx.font = `900 13px ${FONT}`; const tw = ctx.measureText(String(k.price)).width;
+      coinIcon(br.x + br.w / 2 - tw / 2 - 7, br.y + 13, 7);
+      txt(String(k.price), br.x + br.w / 2 + 6, br.y + 14, 13, afford ? '#3a2600' : '#fff', 'center', 900);
+      ctx.globalAlpha = 1;
+    }
+    if (P.deny && P.deny.id === k.id && S.t - P.deny.t < 1.2) txt(`Need ${k.price - meta.coins} more`, cx + cw / 2, cy + 14, 11, '#ff8a95', 'center', 900);
+    P.rects.push(br);
+  });
+  txt('Earn coins by finishing shifts. More stars = more coins.', W / 2, py + ph - 14, 11, 'rgba(255,255,255,.55)', 'center', 700);
+  ctx.restore();
+}
+
 function drawPanel() {
   const P = S.panel, el = S.t - P.t0;
   ctx.fillStyle = `rgba(12,8,28,${Math.min(.75, el * 3)})`; ctx.fillRect(0, 0, W, H);
+  if (P.shop) return drawShop(P, el);
   const lines = wrapLines(P.sub, 290, 15);
-  const ph = 78 + (P.stars ? 78 : 0) + lines.length * 21 + (P.coins ? 36 : 0) + (P.extra ? 30 : 0) + 14 + P.btns.length * 58;
+  const ph = 78 + (P.stars ? 78 : 0) + lines.length * 21 + (P.coins ? 36 : 0) + (P.extra ? 30 : 0) + (P.teaser ? 24 : 0) + 14 + P.btns.length * 58;
   const pw = 344, px = (W - pw) / 2, py = (H - ph) / 2;
   const pop = easeBack(el * 4);
   ctx.save(); ctx.translate(W / 2, H / 2); ctx.scale(pop, pop); ctx.translate(-W / 2, -H / 2);
@@ -841,6 +1230,11 @@ function drawPanel() {
     y += 36;
   }
   if (P.extra) { txt(P.extra, W / 2, y + 10, 13, '#ffd9a8', 'center', 900); y += 30; }
+  if (P.teaser) {
+    ctx.font = `800 12px ${FONT}`; const tw = ctx.measureText(P.teaser).width + 24;
+    ctx.fillStyle = 'rgba(255,210,63,.14)'; rr(W / 2 - tw / 2, y - 4, tw, 22, 11); ctx.fill();
+    txt(P.teaser, W / 2, y + 7, 12, '#ffe27a', 'center', 800); y += 24;
+  }
   let by = py + ph - P.btns.length * 58 - 10;
   P.rects = [];
   for (const b of P.btns) { const r = { x: px + 26, y: by, w: pw - 52, h: 46, fn: b.fn }; button(r.x, r.y, r.w, r.h, b.label, b.primary, 16); P.rects.push(r); by += 58; }
@@ -862,6 +1256,31 @@ function draw() {
   if (S.mode === 'coffee') otxt('☕ Caffeine mode: tap ANY cubicle', W / 2, S.gy + S.rows * S.cell + 30, 14, '#ffd9a8', 'rgba(40,20,0,.7)', 4);
   const ppl = S.people.slice().sort((a, b) => a.y - b.y);
   for (const p of ppl) if (p.delay <= 0) drawPerson(p);
+  const shopOpen = S.panel && S.panel.shop;
+  if (!shopOpen) drawFx();
+  drawBoosters();
+  drawHUD();
+  if (!S.panel && S.banner > 0) {
+    const bm = S.boss || S.daily ? 2.2 : 1.5;
+    const k = S.banner / bm, a = clamp(Math.min(k * 4, (1 - k) * 8), 0, 1);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = S.boss ? 'rgba(90,15,35,.85)' : S.daily ? 'rgba(90,45,10,.85)' : 'rgba(20,10,40,.75)'; ctx.fillRect(0, 385, W, 110);
+    const title = S.daily ? '🔥 DAILY SHIFT' : S.boss ? '⚠ PERFORMANCE REVIEW' : `SHIFT ${S.level}`;
+    otxt(title, W / 2 + (1 - a) * -40, 420, S.boss ? 26 : 34, '#fff', 'rgba(20,10,40,.8)', 5);
+    const sub = S.daily ? 'Same puzzle for everyone today · bonus pay' : S.boss ? `Shift ${S.level} · harder shuffle · DOUBLE PAY` : `${rankOf(S.level)} · ${S.buses.length} shuttles · ${S.bench.length} chairs`;
+    txt(sub, W / 2, 452, 13, '#ffd9a8', 'center', 800);
+    const notes = [];
+    if (S.grid.flat().some(h => h && h.lock)) notes.push('🔒 Meetings: some cubicles open after enough taps');
+    if (S.fog < 99) notes.push(S.fog === 1 ? '☁ Only the shuttle at the stop is visible' : '☁ Shuttles further back are hidden');
+    if (notes.length) txt(notes[Math.floor((1 - k) * notes.length * .999)], W / 2, 476, 11, 'rgba(255,255,255,.75)', 'center', 700);
+    ctx.globalAlpha = 1;
+  }
+  if (S.panel) drawPanel();
+  if (shopOpen) drawFx();
+  if (S.flash > 0) { ctx.fillStyle = `rgba(${S.flashCol},${S.flash * .45})`; ctx.fillRect(-20, -20, W + 40, H + 40); }
+}
+
+function drawFx() {
   for (const q of S.parts) {
     const a = clamp(q.life / q.max * 1.5, 0, 1);
     ctx.globalAlpha = a; ctx.fillStyle = q.col;
@@ -889,18 +1308,6 @@ function draw() {
     }
   }
   ctx.globalAlpha = 1;
-  drawBoosters();
-  drawHUD();
-  if (!S.panel && S.banner > 0) {
-    const k = S.banner / 1.5, a = clamp(Math.min(k * 4, (1 - k) * 8), 0, 1);
-    ctx.globalAlpha = a;
-    ctx.fillStyle = 'rgba(20,10,40,.75)'; ctx.fillRect(0, 395, W, 90);
-    otxt(`SHIFT ${S.level}`, W / 2 + (1 - a) * -40, 428, 34, '#fff', 'rgba(20,10,40,.8)', 5);
-    txt(`${rankOf(S.level)} · ${S.buses.length} shuttles · ${S.bench.length} chairs`, W / 2, 462, 13, '#ffd9a8', 'center', 800);
-    ctx.globalAlpha = 1;
-  }
-  if (S.flash > 0) { ctx.fillStyle = `rgba(${S.flashCol},${S.flash * .45})`; ctx.fillRect(-20, -20, W + 40, H + 40); }
-  if (S.panel) drawPanel();
 }
 
 // ---------- Input ----------
@@ -910,13 +1317,21 @@ function tap(x, y) {
     for (const r of S.panel.rects || []) if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) { tone(660, .08, 'triangle', .1); r.fn(); return; }
     return;
   }
-  if (y < 46 && x > W - 48) { startLevel(S.level); return; }
+  if (y < 46 && x >= 266 && x <= 330) { openShop(); return; }
+  if (y < 46 && x > W - 48) { startLevel(S.level, S.opts); return; }
   if (y < 46 && x > W - 90 && x < W - 50) { muted = !muted; store.set('qt_mute', muted ? '1' : '0'); return; }
   for (let i = 0; i < 3; i++) if (Math.hypot(x - boostX(i), y - (BOOST_Y - 6)) < 34) { useBooster(i); return; }
   if (S.losing || S.over || S.won) return;
   const c = Math.floor((x - S.gx) / S.cell), r = Math.floor((y - S.gy) / S.cell);
   if (r < 0 || c < 0 || r >= S.rows || c >= S.cols) { if (S.mode) S.mode = null; return; }
   const h = S.grid[r][c]; if (!h) return;
+  if (isLocked(h)) {
+    h.shake = .3; sfx.nope();
+    const [lx, ly] = cellCenter(r, c);
+    const n = h.lock - S.taps;
+    floatText(lx, ly - 24, `In a meeting · ${n} more tap${n === 1 ? '' : 's'}`, '#ffd9a8', 13);
+    return;
+  }
   if (S.mode === 'coffee') {
     S.mode = null;
     if (S.acc[r][c]) { launch(r, c, false); return; }   // free: no coffee needed
@@ -939,8 +1354,10 @@ showPanel({
   title: 'QUITTING TIME', big: true,
   sub: "It's 5 PM. Tap cubicles to release the workers. Get each one on their color's shuttle. Wrong color? They wait in the break room, and it's tiny.",
   extra: meta.best ? `Best: Shift ${meta.best} · ${rankOf(meta.best)}` : '',
+  teaser: meta.best >= 3 ? teaser() : '',
   btns: [{ label: meta.level > 1 ? `Clock out · Shift ${meta.level} ▶` : 'Clock out ▶', fn: () => { S.panel = null; }, primary: true }]
-    .concat(meta.level > 1 ? [{ label: 'Start over from Shift 1', fn: () => { meta.level = 1; saveMeta(); startLevel(1); } }] : []),
+    .concat(dailyAvailable() ? [{ label: `🔥 Daily Shift${meta.daily.streak && meta.daily.last === dayIndex() - 1 ? ` · keep your ${meta.daily.streak}-day streak` : ' (bonus pay)'}`, fn: () => startLevel(meta.level, { daily: true }) }] : [])
+    .concat(meta.level > 1 ? [{ label: 'Perks Shop', fn: openShop }, { label: 'Start over from Shift 1', fn: () => { meta.level = 1; saveMeta(); startLevel(1); } }] : []),
 });
 let last = performance.now();
 function loop(now) {
