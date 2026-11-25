@@ -63,13 +63,19 @@ const meta = {
   look: store.get('qt_look') || 'none',
   ownedLooks: (() => { try { return JSON.parse(store.get('qt_looks')) || null; } catch (e) { return null; } })() || ['none'],
   daily: (() => { try { return JSON.parse(store.get('qt_daily')) || null; } catch (e) { return null; } })() || { last: -9, streak: 0, best: 0 },
+  stars: (() => { try { return JSON.parse(store.get('qt_stars')) || null; } catch (e) { return null; } })() || {},
+  seen: (() => { try { return JSON.parse(store.get('qt_seen')) || null; } catch (e) { return null; } })() || [],
+  chest: +store.get('qt_chest') || 0,
 };
+const totalStars = () => Object.values(meta.stars).reduce((a, b) => a + b, 0);
+const CHEST_EVERY = 20;
 function saveMeta() {
   store.set('qt_level', meta.level); store.set('qt_best', meta.best);
   store.set('qt_coins', meta.coins); store.set('qt_inv', JSON.stringify(meta.inv));
   store.set('qt_bus', meta.bus); store.set('qt_owned', JSON.stringify(meta.owned));
   store.set('qt_look', meta.look); store.set('qt_looks', JSON.stringify(meta.ownedLooks));
   store.set('qt_daily', JSON.stringify(meta.daily));
+  store.set('qt_stars', JSON.stringify(meta.stars)); store.set('qt_seen', JSON.stringify(meta.seen)); store.set('qt_chest', meta.chest);
 }
 
 // Worker looks: accessories on top of the route-colored outfit, so color matching never changes.
@@ -216,6 +222,7 @@ function genLevel(L, seed, boss = isBoss(L)) {
 
 // ---------- Game state ----------
 let S = null;
+let mode = 'home';   // 'home' (tower map) or 'game'
 
 const dailyAvailable = () => meta.daily.last !== dayIndex() && meta.best >= 3;
 // "Next goal" nudge shown on the win screen: the cheapest thing you don't own yet.
@@ -251,6 +258,7 @@ function startLevel(L, opts = {}) {
   S.gx = (W - S.cols * S.cell) / 2;
   S.gy = GRID_TOP;
   refreshAccess(true);
+  if (mode === 'game') maybeTip();
 }
 
 function refreshAccess(silent) {
@@ -478,7 +486,7 @@ function showPanel(p) { p.t0 = S.t; S.panel = p; }
 
 function update(dt) {
   S.t += dt;
-  if (S.panel && S.panel.shop) {   // gameplay pauses while shopping; only effects keep moving
+  if (mode === 'home' || (S.panel && (S.panel.shop || S.panel.pause))) {   // paused: only effects keep moving
     for (let i = S.parts.length - 1; i >= 0; i--) { const q = S.parts[i]; q.life -= dt; if (q.life <= 0) { S.parts.splice(i, 1); continue; } q.vy += q.g * dt; q.x += q.vx * dt; q.y += q.vy * dt; if (q.kind === 'conf') q.rot += q.vr * dt; }
     for (let i = S.texts.length - 1; i >= 0; i--) { const t = S.texts[i]; t.t -= dt; if (t.t <= 0) S.texts.splice(i, 1); }
     if (S.flash > 0) S.flash -= dt;
@@ -575,6 +583,7 @@ function update(dt) {
     if (S.undo.length) btns.push({ label: meta.inv.undo > 0 ? `↶ Undo last tap (${meta.inv.undo} left)` : `↶ Undo last tap ($${BOOSTERS[0].price})`, fn: () => { if (consume(0)) doUndo(); }, primary: true });
     if (!S.revived) btns.push({ label: '🪑 Expense more chairs (free, 1×)', fn: revive, primary: !S.undo.length });
     btns.push({ label: 'Retry shift', fn: () => startLevel(S.level, S.opts) });
+    btns.push({ label: '🏢 Back to the map', fn: goHome });
     showPanel({ title: 'Break room overflow!', sub: 'HR has concerns. So does the fire marshal.', btns });
   }
   // Win
@@ -592,15 +601,23 @@ function update(dt) {
       meta.daily = { last: today, streak, best: Math.max(d.best || 0, streak) };
       gift = pick(BOOSTERS); meta.inv[gift.id]++;
     } else {
+      const firstClear = S.level >= meta.level;   // replays of old shifts pay half, no gifts/promotions
       if (S.boss) earned *= 2;
-      promoted = rankOf(S.level + 1) !== rankOf(S.level);
-      if (promoted) earned += 100;
-      meta.level = S.level + 1; meta.best = Math.max(meta.best, S.level);
-      if (S.level % 3 === 0 || S.boss) { gift = pick(BOOSTERS); meta.inv[gift.id]++; }
+      if (firstClear) {
+        promoted = rankOf(S.level + 1) !== rankOf(S.level);
+        if (promoted) earned += 100;
+        if (S.level % 3 === 0 || S.boss) { gift = pick(BOOSTERS); meta.inv[gift.id]++; }
+      } else earned = Math.ceil(earned / 2);
+      meta.level = Math.max(meta.level, S.level + 1); meta.best = Math.max(meta.best, S.level);
+    }
+    let newBest = false;
+    if (!S.daily) {
+      const prev = meta.stars[S.level] || 0;
+      if (stars > prev) { meta.stars[S.level] = stars; newBest = prev > 0; }
     }
     meta.coins += earned;
     saveMeta();
-    S.pendingWin = { stars, earned, promoted, gift, streak, perfect };
+    S.pendingWin = { stars, earned, promoted, gift, streak, perfect, newBest, replay: !S.daily && S.level < meta.level - 1 };
   }
   if (S.won && !S.panel && S.t - S.won > .9) {
     const w = S.pendingWin;
@@ -610,11 +627,14 @@ function update(dt) {
     if (S.daily) extra = `🔥 Daily streak: ${w.streak} day${w.streak === 1 ? '' : 's'}`;
     else if (w.promoted) extra = `🎉 PROMOTED to ${rankOf(S.level + 1)}! +$100`;
     else if (S.boss) extra = '📈 Review passed: double pay!';
+    if (w.newBest) extra = '⭐ New best on this shift!' + (extra ? '   ' + extra : '');
+    else if (w.replay && !extra) extra = 'Replay pays half. New stars still count!';
     if (w.gift) extra += (extra ? '   ' : '') + `🎁 +1 ${w.gift.icon}`;
     const btns = S.daily
-      ? [{ label: `Back to Shift ${meta.level} ▶`, fn: () => startLevel(meta.level), primary: true }, { label: 'Perks Shop', fn: openShop }]
-      : [{ label: `Next shift ▶`, fn: () => startLevel(S.level + 1), primary: true }, { label: 'Perks Shop', fn: openShop }];
-    if (!S.daily && dailyAvailable()) btns.splice(1, 0, { label: '🔥 Daily Shift (bonus pay)', fn: () => startLevel(meta.level, { daily: true }) });
+      ? [{ label: `Back to Shift ${meta.level} ▶`, fn: () => startLevel(meta.level), primary: true }]
+      : [{ label: `Next shift ▶`, fn: () => startLevel(S.level + 1), primary: true }];
+    if (!S.daily && dailyAvailable()) btns.push({ label: '🔥 Daily Shift (bonus pay)', fn: () => startLevel(meta.level, { daily: true }) });
+    btns.push({ label: 'Perks Shop', fn: openShop }, { label: '🏢 Back to the map', fn: goHome });
     showPanel({ title: S.daily ? 'Daily shift done!' : S.boss ? 'Review passed!' : 'Shift complete!', sub, stars: w.stars, coins: w.earned, extra, teaser: teaser(),
       btns });
     for (let i = 0; i < w.stars; i++) sfx.star && setTimeout(() => sfx.star(i), 350 + i * 250);
@@ -1047,8 +1067,8 @@ function drawHUD() {
   coinIcon(208, 25, 8); txt(String(meta.coins), 221, 26, 14, '#ffd23f', 'left', 900);
   button(270, 9, 58, 32, 'SHOP', true, 12);
   if (canBuyAnything()) circle(324, 11, 5 + Math.sin(S.t * 6) * 1, '#ff5a5f');
-  button(W - 46, 9, 36, 32, '⟲', false, 17);
-  button(W - 88, 9, 36, 32, muted ? '🔇' : '🔊', false, 14);
+  button(W - 46, 9, 36, 32, '', false, 17); iconMenu(W - 28, 25);
+  button(W - 88, 9, 36, 32, '', false, 14); iconHome(W - 70, 25, '#fff');
   // progress
   const seated = S.buses.reduce((a, b) => a + b.seated, 0);
   ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(14, 54, W - 28, 7, 3.5); ctx.fill();
@@ -1099,6 +1119,33 @@ function wrapLines(s, maxW, size) {
 function coinIcon(x, y, r) {
   circle(x, y + 1, r, '#c78f00'); circle(x, y, r, '#ffd23f'); circle(x, y, r * .7, '#ffe27a');
   txt('$', x, y + .5, r * 1.15, '#a56f00', 'center', 900);
+}
+
+function iconHome(x, y, col) {
+  ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(x - 9, y - 1); ctx.lineTo(x, y - 9); ctx.lineTo(x + 9, y - 1); ctx.closePath(); ctx.fill();
+  rr(x - 6.5, y - 2, 13, 10, 1.5); ctx.fill();
+  ctx.fillStyle = '#463a70'; rr(x - 2, y + 2, 4, 6, 1); ctx.fill();
+}
+function iconMenu(x, y) { ctx.fillStyle = '#fff'; for (let i = -1; i <= 1; i++) { rr(x - 8, y + i * 6 - 1.5, 16, 3, 1.5); ctx.fill(); } }
+function toggleMute() { muted = !muted; store.set('qt_mute', muted ? '1' : '0'); }
+
+function openPause() {
+  if (S.won) return;
+  const P = {
+    pause: true, title: 'Paused', sub: 'The shuttles will wait. Probably.',
+    btns: [
+      { label: 'Resume ▶', fn: () => { S.panel = null; }, primary: true },
+      { label: '⟲ Restart shift', fn: () => startLevel(S.level, S.opts) },
+      { label: muted ? '🔇 Sound: Off' : '🔊 Sound: On', fn: () => { toggleMute(); openPause(); } },
+      { label: '🏢 Back to the map', fn: goHome },
+    ],
+  };
+  showPanel(P); P.t0 = S.t - .3;
+}
+function askHome() {
+  if (S.won || S.taps === 0) return goHome();
+  showPanel({ pause: true, title: 'Clock out early?', sub: "You'll lose your progress on this shift.",
+    btns: [{ label: 'Keep playing', fn: () => { S.panel = null; }, primary: true }, { label: '🏢 Leave to the map', fn: goHome }] });
 }
 
 function openShop() {
@@ -1202,7 +1249,8 @@ function drawPanel() {
   ctx.fillStyle = `rgba(12,8,28,${Math.min(.75, el * 3)})`; ctx.fillRect(0, 0, W, H);
   if (P.shop) return drawShop(P, el);
   const lines = wrapLines(P.sub, 290, 15);
-  const ph = 78 + (P.stars ? 78 : 0) + lines.length * 21 + (P.coins ? 36 : 0) + (P.extra ? 30 : 0) + (P.teaser ? 24 : 0) + 14 + P.btns.length * 58;
+  const hasStars = P.stars || P.starRow;
+  const ph = 78 + (hasStars ? 78 : 0) + lines.length * 21 + (P.coins ? 36 : 0) + (P.extra ? 30 : 0) + (P.teaser ? 24 : 0) + 14 + P.btns.length * 58;
   const pw = 344, px = (W - pw) / 2, py = (H - ph) / 2;
   const pop = easeBack(el * 4);
   ctx.save(); ctx.translate(W / 2, H / 2); ctx.scale(pop, pop); ctx.translate(-W / 2, -H / 2);
@@ -1213,7 +1261,7 @@ function drawPanel() {
   let y = py + 44;
   otxt(P.title, W / 2, y, P.big ? 36 : 27, '#fff', 'rgba(20,10,40,.7)', 5);
   y += 36;
-  if (P.stars) {
+  if (hasStars) {
     for (let i = 0; i < 3; i++) {
       const t = el - .35 - i * .25, sc = t > 0 ? easeBack(t * 3.5) : 0, sx = W / 2 + (i - 1) * 62, sy = y + 30 - (i === 1 ? 8 : 0);
       starShape(sx, sy, 24, 'rgba(0,0,0,.35)');
@@ -1310,16 +1358,280 @@ function drawFx() {
   ctx.globalAlpha = 1;
 }
 
+// =====================================================================
+//  HOME: a skyscraper map. Every shift is a floor, and it climbs forever.
+// =====================================================================
+const SP = 96, MAP_TOP = 104, MAP_BOT = 632;
+const HOME = { scroll: 0, vel: 0, drag: false, rects: [] };
+const nodeX = L => W / 2 + Math.sin(L * 1.05) * 112;
+const nodeY = L => -(L - 1) * SP + HOME.scroll;
+function clampScroll() {
+  const min = 540, max = 220 + (meta.level + 5) * SP;
+  HOME.scroll = clamp(HOME.scroll, min, Math.max(min, max));
+}
+function homeCenterOn(L) { HOME.scroll = 420 + (L - 1) * SP; HOME.vel = 0; clampScroll(); }
+
+function goHome() {
+  mode = 'home'; S.panel = null; S.parts = []; S.texts = []; S.mode = null; S.flash = 0; S.shake = 0;
+  homeCenterOn(meta.level);
+}
+function playLevel(L, opts) { mode = 'game'; startLevel(L, opts); }
+
+const TIPS = [
+  ['six', () => S.grid.flat().some(h => h && h.n === 6), '6-person teams', 'Cubicles with a 6 badge release six workers: enough for two shuttles of their color.'],
+  ['mystery', () => S.grid.flat().some(h => h && h.mystery), 'Mystery cubicles', 'A "?" cubicle hides its color until it has a clear path to the exit.'],
+  ['review', () => S.boss, 'Performance Review', 'Every 10th shift: a nastier shuttle order, but double pay and a free booster.'],
+  ['lock', () => S.grid.flat().some(h => h && h.lock), 'Meetings', 'Locked cubicles open after enough taps anywhere on the board. The gold tag counts down.'],
+  ['fog2', () => S.fog === 2, 'Hidden shuttles', 'From here on you only see the next shuttle in line. Plan ahead!'],
+  ['chairs4', () => S.bench.length === 4, 'Budget cuts', 'The break room is down to 4 chairs. Every tap counts.'],
+  ['fog1', () => S.fog === 1, 'Total fog', 'Only the shuttle at the stop is visible now. Trust your gut.'],
+];
+function maybeTip() {
+  for (const [id, test, title, sub] of TIPS) if (!meta.seen.includes(id) && test()) {
+    meta.seen.push(id); saveMeta();
+    showPanel({ pause: true, title: 'NEW: ' + title, sub, btns: [{ label: 'Got it ▶', fn: () => { S.panel = null; }, primary: true }] });
+    return;
+  }
+}
+
+function levelNotes(L) {
+  const n = [];
+  if (isBoss(L)) n.push('⚠ Performance Review: tougher shuffle, double pay.');
+  if (L >= 50) n.push('☁ Only the front shuttle is visible.'); else if (L >= 30) n.push('☁ Shuttles further back are hidden.');
+  if (L >= 40) n.push('🪑 Only 4 chairs.');
+  if (L >= 20) n.push('🔒 Meetings lock some cubicles.');
+  return n;
+}
+function openLevelCard(L) {
+  const replay = L < meta.level, n = levelNotes(L);
+  const sub = n.length ? n.slice(0, 2).join(' ') : replay ? 'Replay it to collect more stars.' : `${rankOf(L)} floor. Your next shift!`;
+  showPanel({ pause: true, title: `Shift ${L}`, starRow: true, stars: meta.stars[L] || 0, sub,
+    extra: replay ? (meta.stars[L] === 3 ? '⭐ All 3 stars collected!' : 'Replays pay half. New stars count toward chests.') : '',
+    btns: [{ label: replay ? 'Replay ▶' : 'Play ▶', fn: () => playLevel(L), primary: true }, { label: 'Close', fn: () => { S.panel = null; } }] });
+  sfx.chair();
+}
+function chestReady() { return totalStars() >= meta.chest + CHEST_EVERY; }
+function claimChest() {
+  if (!chestReady()) return;
+  meta.chest += CHEST_EVERY;
+  const g1 = pick(BOOSTERS), g2 = pick(BOOSTERS);
+  meta.coins += 75; meta.inv[g1.id]++; meta.inv[g2.id]++; saveMeta();
+  confetti(W / 2, 120, 60); sfx.win(); S.flash = .3; S.flashCol = '255,230,150';
+  const nm = g => g.name.replace('+', '');
+  const gifts = g1.id === g2.id ? `+2 ${nm(g1)}` : `+1 ${nm(g1)} and +1 ${nm(g2)}`;
+  showPanel({ pause: true, title: '⭐ Star chest!', sub: `Your stars paid off: +$75 and ${gifts}.`,
+    btns: [{ label: 'Nice!', fn: () => { S.panel = null; }, primary: true }] });
+}
+
+function homeUpdate(dt) {
+  if (HOME.target != null) {
+    HOME.scroll += (HOME.target - HOME.scroll) * Math.min(1, dt * 7);
+    if (Math.abs(HOME.target - HOME.scroll) < 1 || HOME.drag) HOME.target = null;
+    clampScroll();
+  }
+  if (!HOME.drag && Math.abs(HOME.vel) > 1) {
+    HOME.scroll += HOME.vel * dt; HOME.vel *= Math.pow(.03, dt);
+    const before = HOME.scroll; clampScroll(); if (HOME.scroll !== before) HOME.vel = 0;
+  }
+}
+
+const lerpCol = (a, b, k) => {
+  const pa = parseInt(a.slice(1), 16), pb = parseInt(b.slice(1), 16);
+  const ch = s => Math.round(((pa >> s) & 255) + (((pb >> s) & 255) - ((pa >> s) & 255)) * k);
+  return `rgb(${ch(16)},${ch(8)},${ch(0)})`;
+};
+const SKY_STOPS = [[0, '#c8608a', '#ffb070'], [25, '#3a2c78', '#c8608a'], [60, '#121a4a', '#3a2c78'], [120, '#04040c', '#141a3a']];
+function skyAt(v) {
+  let i = 0; while (i < SKY_STOPS.length - 2 && v > SKY_STOPS[i + 1][0]) i++;
+  const [a, ta, ba] = SKY_STOPS[i], [b, tb, bb] = SKY_STOPS[i + 1], k = clamp((v - a) / (b - a), 0, 1);
+  return [lerpCol(ta, tb, k), lerpCol(ba, bb, k)];
+}
+const HSTARS = (() => { const r = mulberry32(5); return Array.from({ length: 70 }, () => ({ x: r() * W, y: r() * H, s: r() * 1.6 + .4, p: r() * 6 })); })();
+
+function drawHome() {
+  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
+  const T = S.t, view = (HOME.scroll - 400) / SP + 1;
+  const [top, bot] = skyAt(view);
+  const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, top); g.addColorStop(1, bot);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  const starA = clamp((view - 12) / 50, 0, 1);
+  if (starA > 0) for (const s of HSTARS) {
+    const y = (s.y + HOME.scroll * .05) % H;
+    ctx.globalAlpha = starA * (.4 + .4 * Math.sin(T * 2 + s.p)); circle(s.x, y, s.s, '#fff');
+  }
+  ctx.globalAlpha = 1;
+  if (view > 90) { // you've left the atmosphere
+    circle(330, 300 + (HOME.scroll * .03) % 200, 22, 'rgba(230,230,255,.5)');
+  }
+  // the tower itself
+  ctx.fillStyle = 'rgba(25,16,50,.55)'; ctx.fillRect(34, 0, W - 68, H);
+  ctx.fillStyle = 'rgba(255,255,255,.05)'; ctx.fillRect(34, 0, 3, H); ctx.fillRect(W - 37, 0, 3, H);
+  const off = HOME.scroll % 26;
+  for (let y = -26 + off; y < H; y += 26) {
+    const row = Math.floor((y - HOME.scroll) / 26);
+    for (let x = 46; x < W - 50; x += 22) {
+      const lit = ((row * 7 + x * 13) % 11) < 3;
+      ctx.fillStyle = lit ? 'rgba(255,214,120,.22)' : 'rgba(255,255,255,.035)'; ctx.fillRect(x, y, 12, 14);
+    }
+  }
+  // lobby / street at the base
+  const baseY = nodeY(1) + 70;
+  if (baseY < H + 40) {
+    ctx.fillStyle = '#29223d'; ctx.fillRect(0, baseY, W, H);
+    ctx.fillStyle = 'rgba(255,230,150,.35)'; for (let x = 0; x < W; x += 40) ctx.fillRect(x + 10, baseY + 26, 20, 3);
+    ctx.fillStyle = '#2bd17e'; rr(W / 2 - 40, baseY - 22, 80, 18, 5); ctx.fill();
+    txt('LOBBY', W / 2, baseY - 13, 11, '#fff', 'center', 900);
+  }
+  const lo = Math.max(1, Math.floor(1 + (HOME.scroll - H - 60) / SP)), hi = Math.floor(1 + (HOME.scroll + 60) / SP) + 1;
+  const maxShow = meta.level + 6;
+  // rank floors
+  for (const [m, name] of RANKS) if (m > 1 && m >= lo && m <= hi + 1 && m <= maxShow) {
+    const y = (nodeY(m - 1) + nodeY(m)) / 2, reached = meta.level >= m;
+    const pathX = (nodeX(m - 1) + nodeX(m)) / 2, left = pathX > W / 2;   // put the label on the side the road isn't
+    ctx.fillStyle = reached ? 'rgba(255,210,63,.18)' : 'rgba(255,255,255,.06)'; ctx.fillRect(34, y - 12, W - 68, 24);
+    txt(`${name.toUpperCase()} FLOORS`, left ? 46 : W - 46, y, 11, reached ? '#ffd23f' : 'rgba(255,255,255,.4)', left ? 'left' : 'right', 900);
+  }
+  // road between floors
+  for (let L = lo; L < Math.min(hi, maxShow); L++) {
+    const x1 = nodeX(L), y1 = nodeY(L), x2 = nodeX(L + 1), y2 = nodeY(L + 1), done = L + 1 <= meta.level;
+    ctx.strokeStyle = done ? 'rgba(255,210,63,.85)' : 'rgba(255,255,255,.22)'; ctx.lineWidth = done ? 7 : 5; ctx.lineCap = 'round';
+    ctx.setLineDash(done ? [] : [2, 12]);
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.bezierCurveTo(x1, y1 - SP * .5, x2, y2 + SP * .5, x2, y2); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  HOME.rects = [];
+  for (let L = lo; L <= Math.min(hi, maxShow); L++) drawNode(L, T, L > meta.level + 3 ? clamp(1 - (L - meta.level - 3) / 3.5, 0, 1) : 1);
+  // you-are-here worker beside the current floor
+  const cx = nodeX(meta.level), cy = nodeY(meta.level);
+  if (cy > MAP_TOP - 40 && cy < MAP_BOT + 40) {
+    const side = cx > W / 2 ? -1 : 1;
+    ctx.save(); ctx.translate(cx + side * 58, cy); ctx.scale(1.7, 1.7);
+    drawPerson({ x: 0, y: Math.sin(T * 5) * 1.5, color: meta.level % PAL.length, skin: SKIN[1], hair: HAIR[0], bag: true, path: [], moving: false, phase: 0, hop: Math.max(0, Math.sin(T * 4)) * .5, dir: -side, look: meta.look, fly: false, delay: 0 }); ctx.restore();
+  }
+  drawHomeChrome(T);
+}
+
+function drawNode(L, T, alpha) {
+  const x = nodeX(L), y = nodeY(L);
+  if (y < MAP_TOP - 60 || y > MAP_BOT + 60) return;
+  const unlocked = L <= meta.level, cur = L === meta.level, boss = isBoss(L), done = L < meta.level;
+  const r = cur ? 31 : boss ? 29 : 25;
+  ctx.globalAlpha = alpha;
+  if (cur) { circle(x, y, r + 9 + Math.sin(T * 4) * 3, 'rgba(255,210,63,.25)'); circle(x, y, r + 4, 'rgba(255,210,63,.4)'); }
+  circle(x, y + 5, r, 'rgba(0,0,0,.35)');
+  const base = !unlocked ? '#4a4363' : cur ? '#ffd23f' : boss ? '#ff6b7a' : '#7d6cc0';
+  const gg = ctx.createLinearGradient(0, y - r, 0, y + r); gg.addColorStop(0, shade(base, .3)); gg.addColorStop(1, shade(base, -.2));
+  ctx.fillStyle = gg; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+  ctx.strokeStyle = unlocked ? '#fff' : 'rgba(255,255,255,.25)'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = 'rgba(255,255,255,.25)'; ctx.beginPath(); ctx.ellipse(x, y - r * .45, r * .6, r * .28, 0, 0, 7); ctx.fill();
+  if (unlocked) otxt(String(L), x, y + 1, L >= 100 ? 15 : 18, cur ? '#3a2600' : '#fff', cur ? 'rgba(255,255,255,.6)' : 'rgba(20,10,40,.6)', 3);
+  else {
+    txt(String(L), x, y - 5, 12, 'rgba(255,255,255,.45)', 'center', 900);
+    ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y + 6, 3.5, Math.PI, 0); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,.5)'; rr(x - 5, y + 6, 10, 8, 2); ctx.fill();
+  }
+  if (boss) { ctx.fillStyle = unlocked ? '#ff4b5c' : '#5a3a4a'; rr(x - 26, y - r - 15, 52, 15, 7); ctx.fill(); txt('REVIEW', x, y - r - 7, 9, '#fff', 'center', 900); }
+  if (done) {
+    const st = meta.stars[L] || 0;
+    for (let i = 0; i < 3; i++) starShape(x + (i - 1) * 15, y + r + 8 - (i === 1 ? 3 : 0), 7, i < st ? '#ffd23f' : 'rgba(0,0,0,.4)', i < st ? '#fff6c8' : null);
+  }
+  if (cur) { ctx.fillStyle = '#35d07f'; rr(x - 22, y + r + 2, 44, 16, 8); ctx.fill(); txt('PLAY', x, y + r + 10.5, 10, '#fff', 'center', 900); }
+  ctx.globalAlpha = 1;
+  HOME.rects.push({ x: x - r - 6, y: y - r - 6, w: (r + 6) * 2, h: (r + 6) * 2, fn: () => {
+    if (unlocked) openLevelCard(L);
+    else { sfx.nope(); floatText(x, y - 40, `Clear Shift ${meta.level} first`, '#ffd9a8', 14); }
+  } });
+}
+
+function drawHomeChrome(T) {
+  // top bar
+  const tg = ctx.createLinearGradient(0, 0, 0, MAP_TOP); tg.addColorStop(0, 'rgba(20,12,40,.95)'); tg.addColorStop(1, 'rgba(20,12,40,.55)');
+  ctx.fillStyle = tg; ctx.fillRect(0, 0, W, MAP_TOP);
+  otxt('QUITTING TIME', W / 2, 26, 24, '#fff', 'rgba(20,10,40,.8)', 5);
+  txt(`${rankOf(meta.level).toUpperCase()} · SHIFT ${meta.level}`, W / 2, 48, 10, '#ffd9a8', 'center', 900);
+  ctx.fillStyle = 'rgba(0,0,0,.4)'; rr(14, 62, 92, 30, 15); ctx.fill();
+  coinIcon(31, 77, 9); txt(String(meta.coins), 46, 78, 14, '#ffd23f', 'left', 900);
+  // star chest progress
+  const tot = totalStars(), into = tot - meta.chest, ready = chestReady();
+  const bx = 114, bw = W - 128;
+  ctx.fillStyle = 'rgba(0,0,0,.4)'; rr(bx, 62, bw, 30, 15); ctx.fill();
+  starShape(bx + 17, 77, 9, '#ffd23f', '#fff6c8');
+  txt(String(tot), bx + 32, 78, 13, '#fff', 'left', 900);
+  const px0 = bx + 64, pw = bw - 112;
+  ctx.fillStyle = 'rgba(255,255,255,.12)'; rr(px0, 72, pw, 10, 5); ctx.fill();
+  ctx.fillStyle = ready ? '#35d07f' : '#ffd23f'; rr(px0, 72, Math.max(10, pw * clamp(into / CHEST_EVERY, 0, 1)), 10, 5); ctx.fill();
+  const chx = bx + bw - 26, bounce = ready ? Math.abs(Math.sin(T * 5)) * 4 : 0;
+  ctx.fillStyle = ready ? '#ff8a3d' : '#7a5a3a'; rr(chx - 13, 66 - bounce, 26, 20, 4); ctx.fill();
+  ctx.fillStyle = ready ? '#ffd23f' : '#a8854f'; ctx.fillRect(chx - 13, 73 - bounce, 26, 3); ctx.fillRect(chx - 2, 70 - bounce, 4, 8);
+  if (ready) { circle(chx + 12, 64 - bounce, 5, '#ff5a5f'); HOME.rects.unshift({ x: bx, y: 58, w: bw, h: 38, fn: claimChest }); }
+  else txt(`${into}/${CHEST_EVERY}`, px0 + pw / 2, 77.5, 8, '#3a2600', 'center', 900);
+  // "back to my floor" pill
+  const cy = nodeY(meta.level);
+  if (cy < MAP_TOP - 10 || cy > MAP_BOT + 10) {
+    const up = cy < MAP_TOP, py = up ? MAP_TOP + 10 : MAP_BOT - 40;
+    ctx.fillStyle = 'rgba(20,12,40,.85)'; rr(W / 2 - 80, py, 160, 30, 15); ctx.fill();
+    ctx.strokeStyle = '#ffd23f'; ctx.lineWidth = 2; ctx.stroke();
+    txt(`${up ? '▲' : '▼'} Back to Shift ${meta.level}`, W / 2, py + 15.5, 12, '#ffd23f', 'center', 900);
+    HOME.rects.unshift({ x: W / 2 - 80, y: py, w: 160, h: 30, fn: () => { HOME.target = 420 + (meta.level - 1) * SP; } });
+  }
+  // bottom bar
+  const bg = ctx.createLinearGradient(0, MAP_BOT, 0, H); bg.addColorStop(0, 'rgba(20,12,40,.6)'); bg.addColorStop(.25, 'rgba(20,12,40,.95)');
+  ctx.fillStyle = bg; ctx.fillRect(0, MAP_BOT, W, H - MAP_BOT);
+  const boss = isBoss(meta.level);
+  const pb = { x: 28, y: MAP_BOT + 14, w: W - 56, h: 54, fn: () => playLevel(meta.level) };
+  const pulse = 1 + Math.sin(T * 4) * .02;
+  ctx.save(); ctx.translate(W / 2, pb.y + pb.h / 2); ctx.scale(pulse, pulse); ctx.translate(-W / 2, -(pb.y + pb.h / 2));
+  button(pb.x, pb.y, pb.w, pb.h, boss ? `⚠ REVIEW · SHIFT ${meta.level} ▶` : `PLAY SHIFT ${meta.level} ▶`, true, 20);
+  ctx.restore();
+  HOME.rects.unshift(pb);
+  const bw3 = (W - 56 - 20) / 3, by = MAP_BOT + 80;
+  const dAvail = dailyAvailable(), dDone = meta.daily.last === dayIndex();
+  const items = [
+    { label: dDone ? '✓ Daily' : '🔥 Daily', fn: () => {
+        if (dAvail) playLevel(meta.level, { daily: true });
+        else { sfx.nope(); floatText(W / 2, by - 10, dDone ? 'Come back tomorrow for a new one!' : 'Unlocks after Shift 3', '#ffd9a8', 14); }
+      }, dot: dAvail },
+    { label: 'Shop', fn: openShop, dot: canBuyAnything() },
+    { label: muted ? '🔇 Sound' : '🔊 Sound', fn: toggleMute },
+  ];
+  items.forEach((it, i) => {
+    const r = { x: 28 + i * (bw3 + 10), y: by, w: bw3, h: 40, fn: it.fn };
+    ctx.globalAlpha = i === 0 && !dAvail ? .6 : 1;
+    button(r.x, r.y, r.w, r.h, it.label, false, 14);
+    ctx.globalAlpha = 1;
+    if (it.dot) circle(r.x + r.w - 6, r.y + 4, 5 + Math.sin(T * 6), '#ff5a5f');
+    HOME.rects.unshift(r);
+  });
+  if (meta.daily.streak && (meta.daily.last === dayIndex() || meta.daily.last === dayIndex() - 1))
+    txt(`🔥 ${meta.daily.streak}-day streak`, 28 + bw3 / 2, by + 50, 9.5, '#ffb070', 'center', 900);
+}
+
+function homeTap(x, y) {
+  for (const r of HOME.rects) if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+    if (r.y < MAP_BOT && r.y > MAP_TOP - 80 && r.h > 50 && r.w === r.h && (y < MAP_TOP || y > MAP_BOT)) continue; // node hidden under a bar
+    tone(660, .06, 'triangle', .08); r.fn(); return;
+  }
+}
+
+function drawHomeFrame() {
+  drawHome();
+  const shopOpen = S.panel && S.panel.shop;
+  if (!shopOpen) drawFx();
+  if (S.panel) drawPanel();
+  if (shopOpen) drawFx();
+  if (S.flash > 0) { ctx.fillStyle = `rgba(${S.flashCol},${S.flash * .45})`; ctx.fillRect(-20, -20, W + 40, H + 40); }
+}
+
 // ---------- Input ----------
 function tap(x, y) {
   if (S.panel) {
-    if (S.t - S.panel.t0 < .25) return;
+    if (S.t - S.panel.t0 < .2) return;
     for (const r of S.panel.rects || []) if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) { tone(660, .08, 'triangle', .1); r.fn(); return; }
     return;
   }
   if (y < 46 && x >= 266 && x <= 330) { openShop(); return; }
-  if (y < 46 && x > W - 48) { startLevel(S.level, S.opts); return; }
-  if (y < 46 && x > W - 90 && x < W - 50) { muted = !muted; store.set('qt_mute', muted ? '1' : '0'); return; }
+  if (y < 46 && x > W - 48) { openPause(); return; }
+  if (y < 46 && x > W - 90 && x < W - 50) { askHome(); return; }
   for (let i = 0; i < 3; i++) if (Math.hypot(x - boostX(i), y - (BOOST_Y - 6)) < 34) { useBooster(i); return; }
   if (S.losing || S.over || S.won) return;
   const c = Math.floor((x - S.gx) / S.cell), r = Math.floor((y - S.gy) / S.cell);
@@ -1341,33 +1653,68 @@ function tap(x, y) {
   if (S.acc[r][c]) launch(r, c, false);
   else { h.shake = .3; sfx.nope(); }
 }
+const toLocal = e => { const b = cv.getBoundingClientRect(); return [(e.clientX - b.left) / scale, (e.clientY - b.top) / scale]; };
+let ptr = null;
 cv.addEventListener('pointerdown', e => {
-  const b = cv.getBoundingClientRect();
   try { const a = au(); if (a.state === 'suspended') a.resume(); } catch (err) {}
-  tap((e.clientX - b.left) / scale, (e.clientY - b.top) / scale);
+  const [x, y] = toLocal(e);
+  if (mode === 'home' && !S.panel) {   // the map scrolls: decide tap vs drag on release
+    ptr = { x, y, last: y, moved: 0, t: performance.now() };
+    HOME.drag = true; HOME.vel = 0; HOME.target = null;
+    try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+    return;
+  }
+  tap(x, y);
 });
-addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 'z' || e.key === 'u') { if (!S.panel) useBooster(0); } });
+cv.addEventListener('pointermove', e => {
+  if (!ptr) return;
+  const [, y] = toLocal(e), dy = y - ptr.last, now = performance.now();
+  ptr.last = y; ptr.moved += Math.abs(dy);
+  HOME.scroll += dy; clampScroll();
+  HOME.vel = clamp(dy / Math.max(.008, (now - ptr.t) / 1000), -2600, 2600); ptr.t = now;
+});
+cv.addEventListener('pointerup', () => {
+  if (!ptr) return;
+  HOME.drag = false;
+  if (ptr.moved < 8) { HOME.vel = 0; homeTap(ptr.x, ptr.y); }
+  else if (performance.now() - ptr.t > 90) HOME.vel = 0;
+  ptr = null;
+});
+cv.addEventListener('pointercancel', () => { ptr = null; HOME.drag = false; });
+cv.addEventListener('wheel', e => {
+  if (mode !== 'home' || S.panel) return;
+  e.preventDefault(); HOME.target = null; HOME.vel = 0; HOME.scroll -= e.deltaY * .8; clampScroll();
+}, { passive: false });
+addEventListener('keydown', e => {
+  if (mode !== 'game') return;
+  if ((e.ctrlKey || e.metaKey) && e.key === 'z' || e.key === 'u') { if (!S.panel) useBooster(0); }
+  if (e.key === 'Escape') { if (!S.panel) openPause(); else if (S.panel.pause && !S.panel.shop) S.panel = null; }
+});
 
 // ---------- Boot ----------
 startLevel(meta.level);
-showPanel({
-  title: 'QUITTING TIME', big: true,
-  sub: "It's 5 PM. Tap cubicles to release the workers. Get each one on their color's shuttle. Wrong color? They wait in the break room, and it's tiny.",
-  extra: meta.best ? `Best: Shift ${meta.best} · ${rankOf(meta.best)}` : '',
-  teaser: meta.best >= 3 ? teaser() : '',
-  btns: [{ label: meta.level > 1 ? `Clock out · Shift ${meta.level} ▶` : 'Clock out ▶', fn: () => { S.panel = null; }, primary: true }]
-    .concat(dailyAvailable() ? [{ label: `🔥 Daily Shift${meta.daily.streak && meta.daily.last === dayIndex() - 1 ? ` · keep your ${meta.daily.streak}-day streak` : ' (bonus pay)'}`, fn: () => startLevel(meta.level, { daily: true }) }] : [])
-    .concat(meta.level > 1 ? [{ label: 'Perks Shop', fn: openShop }, { label: 'Start over from Shift 1', fn: () => { meta.level = 1; saveMeta(); startLevel(1); } }] : []),
-});
+homeCenterOn(meta.level);
+if (meta.level === 1 && !meta.best) {
+  showPanel({
+    title: 'QUITTING TIME', big: true,
+    sub: "It's 5 PM. Tap cubicles to release the workers. Get each one on their color's shuttle. Wrong color? They wait in the break room, and it's tiny.",
+    btns: [{ label: 'Clock in ▶', fn: () => playLevel(1), primary: true }],
+  });
+}
+function frame(dt) {
+  update(dt);
+  if (mode === 'home') { homeUpdate(dt); drawHomeFrame(); } else draw();
+}
 let last = performance.now();
 function loop(now) {
   const dt = Math.min(.05, (now - last) / 1000); last = now;
-  update(dt); draw();
+  frame(dt);
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);
 
-window.__qt = { get S() { return S; }, tap, startLevel, sim, genLevel, meta, useBooster, step(sec) { for (let i = 0; i < sec * 60; i++) update(1 / 60); draw(); } };
+window.__qt = { get S() { return S; }, get mode() { return mode; }, HOME, tap, homeTap, playLevel, goHome, startLevel, sim, genLevel, meta, useBooster,
+  step(sec) { for (let i = 0; i < sec * 60; i++) { update(1 / 60); if (mode === 'home') homeUpdate(1 / 60); } if (mode === 'home') drawHomeFrame(); else draw(); } };
 </script>
 </body>
 </html>
