@@ -66,6 +66,8 @@ const meta = {
   stars: (() => { try { return JSON.parse(store.get('qt_stars')) || null; } catch (e) { return null; } })() || {},
   seen: (() => { try { return JSON.parse(store.get('qt_seen')) || null; } catch (e) { return null; } })() || [],
   chest: +store.get('qt_chest') || 0,
+  set: Object.assign({ music: true, vib: true, sym: false }, (() => { try { return JSON.parse(store.get('qt_set')) || {}; } catch (e) { return {}; } })()),
+  missions: (() => { try { return JSON.parse(store.get('qt_tasks')) || null; } catch (e) { return null; } })() || { day: -1, list: [] },
 };
 const totalStars = () => Object.values(meta.stars).reduce((a, b) => a + b, 0);
 const CHEST_EVERY = 20;
@@ -76,6 +78,7 @@ function saveMeta() {
   store.set('qt_look', meta.look); store.set('qt_looks', JSON.stringify(meta.ownedLooks));
   store.set('qt_daily', JSON.stringify(meta.daily));
   store.set('qt_stars', JSON.stringify(meta.stars)); store.set('qt_seen', JSON.stringify(meta.seen)); store.set('qt_chest', meta.chest);
+  store.set('qt_set', JSON.stringify(meta.set)); store.set('qt_tasks', JSON.stringify(meta.missions));
 }
 
 // Worker looks: accessories on top of the route-colored outfit, so color matching never changes.
@@ -127,7 +130,59 @@ const sfx = {
   coffee(){ tone(300, .2, 'sine', .12, 2.5); tone(600, .2, 'triangle', .08, 2, .1); },
   chair() { tone(200, .08, 'square', .05); tone(260, .1, 'square', .05, 1, .09); },
 };
-function buzz(ms) { try { if (navigator.vibrate && navigator.userActivation && navigator.userActivation.hasBeenActive) navigator.vibrate(ms); } catch (e) {} }
+function buzz(ms) { if (!meta.set.vib) return; try { if (navigator.vibrate && navigator.userActivation && navigator.userActivation.hasBeenActive) navigator.vibrate(ms); } catch (e) {} }
+
+// ---------- Music: a soft generated lo-fi "office radio" loop ----------
+// Chords: Fmaj7, Em7, Dm7, Cmaj7. It speeds up and adds a pulse when the break room is nearly full.
+const MUSIC = { next: 0, step: 0, gain: null, noise: null, tense: 0 };
+const CHORDS = [[174.6, 220, 261.6, 329.6], [164.8, 196, 246.9, 293.7], [146.8, 174.6, 220, 261.6], [130.8, 164.8, 196, 246.9]];
+const MELODY = [523.3, 587.3, 659.3, 784, 880, 1046.5];
+function mNote(f, t, d, type, v) {
+  const a = AC, o = a.createOscillator(), g = a.createGain();
+  o.type = type; o.frequency.setValueAtTime(f, t);
+  g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(v, t + Math.min(.03, d * .2)); g.gain.exponentialRampToValueAtTime(.0008, t + d);
+  o.connect(g).connect(MUSIC.gain); o.start(t); o.stop(t + d + .05);
+}
+function mHat(t, v) {
+  const a = AC;
+  if (!MUSIC.noise) { const b = a.createBuffer(1, a.sampleRate * .1, a.sampleRate), d = b.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1; MUSIC.noise = b; }
+  const s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
+  s.buffer = MUSIC.noise; f.type = 'highpass'; f.frequency.value = 7000;
+  g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(.0005, t + .05);
+  s.connect(f).connect(g).connect(MUSIC.gain); s.start(t); s.stop(t + .06);
+}
+function musicTick() {
+  if (!AC || AC.state !== 'running') return;
+  if (!MUSIC.gain) { MUSIC.gain = AC.createGain(); MUSIC.gain.connect(AC.destination); MUSIC.next = AC.currentTime + .1; }
+  const want = meta.set.music && !document.hidden ? .55 : 0;
+  MUSIC.gain.gain.setTargetAtTime(want, AC.currentTime, .3);
+  if (!want) { MUSIC.next = AC.currentTime + .1; return; }
+  const bpm = 84 + MUSIC.tense * 26, eighth = 30 / bpm;
+  while (MUSIC.next < AC.currentTime + .25) {
+    const t = MUSIC.next, st = MUSIC.step, bar = Math.floor(st / 8) % 4, beat = st % 8, ch = CHORDS[bar];
+    if (beat === 0) ch.forEach((f, i) => mNote(f, t + i * .012, eighth * 7.5, 'triangle', .022));
+    if (beat === 0 || beat === 3 || beat === 6) mNote(ch[0] / 2, t, eighth * 1.6, 'sine', .075);
+    if (beat % 2 === 1) mHat(t, .018 + MUSIC.tense * .02);
+    if (MUSIC.tense > .5 && beat % 2 === 0) mNote(ch[0], t, eighth * .5, 'square', .012);
+    if ((st * 7) % 11 < 3 && beat !== 0) mNote(MELODY[(st * 5 + bar) % MELODY.length], t, eighth * 1.8, 'sine', .028);
+    MUSIC.next += eighth; MUSIC.step++;
+  }
+}
+
+// Color-blind helper: every route color also has a shape.
+function drawSym(i, x, y, r, col) {
+  ctx.fillStyle = col; ctx.beginPath();
+  switch (i % 7) {
+    case 0: ctx.arc(x, y, r, 0, 7); break;
+    case 1: ctx.moveTo(x, y - r * 1.1); ctx.lineTo(x + r * 1.05, y + r * .75); ctx.lineTo(x - r * 1.05, y + r * .75); break;
+    case 2: ctx.rect(x - r * .85, y - r * .85, r * 1.7, r * 1.7); break;
+    case 3: ctx.moveTo(x, y - r * 1.15); ctx.lineTo(x + r * .9, y); ctx.lineTo(x, y + r * 1.15); ctx.lineTo(x - r * .9, y); break;
+    case 4: for (let k = 0; k < 10; k++) { const a = -Math.PI / 2 + k * Math.PI / 5, q = k % 2 ? r * .45 : r * 1.1; ctx.lineTo(x + Math.cos(a) * q, y + Math.sin(a) * q); } break;
+    case 5: ctx.rect(x - r * .35, y - r, r * .7, r * 2); ctx.rect(x - r, y - r * .35, r * 2, r * .7); break;
+    case 6: ctx.moveTo(x, y + r); ctx.bezierCurveTo(x - r * 1.6, y - r * .2, x - r * .6, y - r * 1.4, x, y - r * .45); ctx.bezierCurveTo(x + r * .6, y - r * 1.4, x + r * 1.6, y - r * .2, x, y + r); break;
+  }
+  ctx.closePath(); ctx.fill();
+}
 
 // ---------- Level generation ----------
 function access(g, R, C) {
@@ -151,6 +206,7 @@ function access(g, R, C) {
       if (nr >= 0 && nc >= 0 && nr < R && nc < C && reach[nr][nc]) { acc[r][c] = true; break; }
     }
   }
+  acc.reach = reach;
   return acc;
 }
 
@@ -178,6 +234,13 @@ function sim(order, seq, B) {
 const fogFrom = L => L >= 50 ? 1 : L >= 30 ? 2 : 99;
 const isBoss = L => L >= 10 && L % 10 === 0;
 
+// Where is this cubicle's carpool partner? (same link id, different cell)
+function partnerIn(g, h) {
+  if (!h || !h.link) return null;
+  for (let r = 0; r < g.length; r++) for (let c = 0; c < g[r].length; c++) { const o = g[r][c]; if (o && o !== h && o.link === h.link) return [r, c]; }
+  return null;
+}
+
 function genLevel(L, seed, boss = isBoss(L)) {
   const rnd = mulberry32(seed == null ? L * 7919 + 17 : seed);
   const cols = Math.min(L >= 25 ? 6 : 5, 3 + Math.floor(L / 4));
@@ -195,18 +258,51 @@ function genLevel(L, seed, boss = isBoss(L)) {
       g[r].push((r > 0 && rnd() < .12) ? null : { color: Math.floor(rnd() * ncol), n: rnd() < big ? 6 : 3, mystery: rnd() < mys, shake: 0, reveal: 0 });
     }
   }
-  const tmp = g.map(r => r.slice()); const order = [];
-  for (;;) {
-    const acc = access(tmp, rows, cols); const list = [];
-    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) if (tmp[r][c] && acc[r][c]) list.push([r, c]);
-    if (!list.length) break;
-    const [r, c] = list[Math.floor(rnd() * list.length)];
-    order.push(tmp[r][c]); tmp[r][c] = null;
+  // Carpools (L8+): two neighbouring cubicles linked together. Tapping either one sends BOTH
+  // teams out at once, so you have to time it for when both colors can be handled.
+  const prnd = mulberry32((seed == null ? L * 7919 + 17 : seed) + 4242);
+  const poolP = L >= 8 ? Math.min(.24, .12 + (L - 8) * .004) : 0;
+  if (poolP) {
+    const cells = [];
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) if (g[r][c]) cells.push([r, c]);
+    for (let i = cells.length - 1; i > 0; i--) { const j = Math.floor(prnd() * (i + 1)); [cells[i], cells[j]] = [cells[j], cells[i]]; }
+    let id = 1;
+    for (const [r, c] of cells) {
+      const h = g[r][c];
+      if (h.link || prnd() >= poolP / 2) continue;
+      const nb = [[0, 1], [1, 0], [0, -1], [-1, 0]].map(([dr, dc]) => [r + dr, c + dc]).filter(([a, b]) => g[a] && g[a][b] && !g[a][b].link);
+      if (!nb.length) continue;
+      const [a, b] = nb[Math.floor(prnd() * nb.length)];
+      h.link = g[a][b].link = id++; h.mystery = g[a][b].mystery = false;
+    }
+  }
+  // Known solution: tap any reachable cubicle; a carpool releases its partner right after it.
+  const grid = g, order = [], tapAt = [];
+  {
+    const tmp = g.map(r => r.slice()); let taps = 0;
+    for (;;) {
+      const acc = access(tmp, rows, cols); const list = [];
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) if (tmp[r][c] && acc[r][c]) list.push([r, c]);
+      if (!list.length) break;
+      const [r, c] = list[Math.floor(rnd() * list.length)], h = tmp[r][c];
+      order.push(h); tapAt.push(taps); tmp[r][c] = null;
+      const p = h.link ? partnerIn(tmp, h) : null;
+      if (p) { order.push(tmp[p[0]][p[1]]); tapAt.push(taps); tmp[p[0]][p[1]] = null; }
+      taps++;
+    }
+  }
+  // Pickups: cash bags / coffee on sealed-off floor cells, grabbed once a path reaches them.
+  const pickups = [];
+  if (L >= 4) {
+    const reach0 = access(grid, rows, cols).reach;
+    for (let r = 1; r < rows; r++) for (let c = 0; c < cols; c++)
+      if (!grid[r][c] && !reach0[r][c] && pickups.length < 2 && prnd() < .45)
+        pickups.push({ r, c, kind: prnd() < .25 ? 'coffee' : 'cash', amt: 5 + Math.floor(prnd() * 3) * 5 });
   }
   // Locks: a cubicle "in a meeting" opens after N total taps. N never exceeds its slot in the
   // known solution order, so the level always stays solvable.
   order.forEach((h, k) => {
-    if (k >= 3 && rnd() < lockP) h.lock = Math.min(k, 2 + Math.floor(rnd() * Math.min(12, 3 + L / 8)));
+    if (tapAt[k] >= 3 && !h.link && rnd() < lockP) h.lock = Math.min(tapAt[k], 2 + Math.floor(rnd() * Math.min(12, 3 + L / 8)));
   });
   const seq = [];
   for (const h of order) for (let k = 0; k < h.n / 3; k++) seq.push(h.color);
@@ -217,7 +313,7 @@ function genLevel(L, seed, boss = isBoss(L)) {
     [seq[i], seq[j]] = [seq[j], seq[i]];
     if (!sim(order, seq, B)) [seq[i], seq[j]] = [seq[j], seq[i]];
   }
-  return { grid: g, rows, cols, B, seq, order };
+  return { grid, rows, cols, B, seq, order, pickups };
 }
 
 // ---------- Game state ----------
@@ -235,6 +331,40 @@ function teaser() {
   if (aff) return `You can afford ${aff.n} in the shop!`;
   return `Next unlock: ${items[0].n}, $${items[0].p - meta.coins} to go`;
 }
+// ---------- Daily tasks: three small goals a day that pay coins ----------
+const TASK_POOL = [
+  { type: 'workers',  min: 1, text: n => `Send ${n} workers home`,               targets: [60, 120, 200], rewards: [25, 45, 70] },
+  { type: 'combo',    min: 1, text: n => `Hit a combo of ${n}`,targets: [5, 8, 12],     rewards: [25, 40, 60] },
+  { type: 'wins',     min: 1, text: n => `Finish ${n} shifts`,                   targets: [2, 4, 6],      rewards: [25, 45, 65] },
+  { type: 'wins3',    min: 1, text: n => `Get 3 stars on ${n} shift${n > 1 ? 's' : ''}`, targets: [1, 2, 3], rewards: [30, 50, 75] },
+  { type: 'clean',    min: 3, text: n => `Win ${n} shift${n > 1 ? 's' : ''} without boosters`, targets: [1, 2], rewards: [30, 55] },
+  { type: 'carpools', min: 9, text: n => `Send ${n} carpools home`,       targets: [3, 6],         rewards: [30, 50] },
+  { type: 'pickups',  min: 5, text: n => `Grab ${n} cash bags or coffees`,       targets: [2, 4],         rewards: [30, 50] },
+];
+function ensureMissions() {
+  const day = dayIndex();
+  if (meta.missions.day === day && meta.missions.list.every(m => TASK_POOL.some(t => t.type === m.type))) return;
+  const rnd = mulberry32(day * 31 + 7), pool = TASK_POOL.filter(t => meta.level >= t.min), list = [];
+  while (list.length < 3 && pool.length) {
+    const t = pool.splice(Math.floor(rnd() * pool.length), 1)[0], i = Math.floor(rnd() * t.targets.length);
+    list.push({ type: t.type, target: t.targets[i], reward: t.rewards[i], prog: 0, done: false, claimed: false });
+  }
+  meta.missions = { day, list }; saveMeta();
+}
+function missionDone(m) {
+  m.done = true; saveMeta();
+  if (mode === 'game' && S) { floatText(W / 2, 150, '✓ Task complete!', '#7dffb0', 20); tone(880, .1, 'triangle', .1, 1.5); tone(1320, .14, 'triangle', .08, 1, .1); }
+}
+function missionAdd(type, n) {
+  if (!n) return; ensureMissions();
+  for (const m of meta.missions.list) if (m.type === type && !m.done) { m.prog = Math.min(m.target, m.prog + n); if (m.prog >= m.target) missionDone(m); }
+}
+function missionMax(type, v) {
+  ensureMissions();
+  for (const m of meta.missions.list) if (m.type === type && !m.done && v > m.prog) { m.prog = Math.min(m.target, v); if (m.prog >= m.target) missionDone(m); }
+}
+const taskText = m => (TASK_POOL.find(t => t.type === m.type) || TASK_POOL[0]).text(m.target);
+const tasksClaimable = () => { ensureMissions(); return meta.missions.list.filter(m => m.done && !m.claimed).length; };
 const dayIndex = () => { const d = new Date(); return Math.floor((d.getTime() - d.getTimezoneOffset() * 60000) / 86400000); };
 const dailyLevel = day => 14 + (day * 7) % 22;   // rotates between shift-14 and shift-35 difficulty
 
@@ -246,7 +376,7 @@ function startLevel(L, opts = {}) {
   const lv = genLevel(lvL, daily ? day * 104729 + 7 : null, boss || daily);
   S = {
     level: L, lvL, daily, boss, opts, taps: 0, fog: fogFrom(lvL),
-    grid: lv.grid, rows: lv.rows, cols: lv.cols, solution: lv.order,
+    grid: lv.grid, rows: lv.rows, cols: lv.cols, solution: lv.order, pickups: lv.pickups.map(p => ({ ...p })), usedBoost: false, tut: L === 1 && !daily ? 3 : 0,
     bench: Array(lv.B).fill(null),
     buses: lv.seq.map((c, i) => ({ color: c, route: 10 + ((i * 37 + L * 11) % 89), assigned: 0, seated: 0, seats: [null, null, null], x: 470 + i * 140, s: .7, state: 'q', vx: 0, bob: Math.random() * 6, wheel: 0 })),
     people: [], parts: [], texts: [], losing: 0, over: false, won: 0, revived: false,
@@ -269,6 +399,15 @@ function refreshAccess(silent) {
       h.mystery = false; h.reveal = 1;
       if (!silent) { const [x, y] = cellCenter(r, c); burst(x, y, PAL[h.color], 12, 140); tone(880, .12, 'sine', .08, 1.5); }
     }
+  }
+  for (const pk of S.pickups || []) {
+    if (pk.taken || !S.acc.reach[pk.r][pk.c]) continue;
+    pk.taken = true;
+    const [x, y] = cellCenter(pk.r, pk.c);
+    if (pk.kind === 'coffee') { meta.inv.coffee++; floatText(x, y - 20, '+1 ☕ Coffee', '#ffd9a8', 16); burst(x, y, '#c8925a', 14, 150); }
+    else { meta.coins += pk.amt; floatText(x, y - 20, `+$${pk.amt}`, '#7dffb0', 20); burst(x, y, '#3aa86b', 14, 150); }
+    ring(x, y, '#ffffff'); sfx.coin(3); tone(1400, .12, 'triangle', .08, 1.3, .05);
+    missionAdd('pickups', 1); saveMeta();
   }
 }
 
@@ -368,7 +507,7 @@ function doUndo() {
 // ---------- Actions ----------
 function launch(r, c, viaCoffee) {
   snapshot();
-  const h = S.grid[r][c]; S.grid[r][c] = null; S.hint = false;
+  const h = S.grid[r][c]; S.grid[r][c] = null; S.hint = false; if (S.tut > 0) S.tut--;
   const [cx, cy] = cellCenter(r, c);
   let pts;
   if (viaCoffee) pts = [[cx, S.gy - 16]];
@@ -378,18 +517,36 @@ function launch(r, c, viaCoffee) {
     pts.push([ex, S.gy - 16]);
   }
   const crowd = [];
-  for (let k = 0; k < h.n; k++) {
-    const p = mkPerson(h.color, cx + rand(-8, 8), cy + rand(-4, 8));
-    p.path = pts.map(([a, b]) => [a + rand(-9, 9), b + rand(-6, 6)]);
-    p.delay = k * .045; p.fly = !!viaCoffee; p.hop = 1;
-    S.people.push(p); crowd.push(p); assignDest(p);
-  }
+  const spawn = (team, sx, sy, route, d0) => {
+    for (let k = 0; k < team.n; k++) {
+      const p = mkPerson(team.color, sx + rand(-8, 8), sy + rand(-4, 8));
+      p.path = route.map(([a, b]) => [a + rand(-9, 9), b + rand(-6, 6)]);
+      p.delay = d0 + k * .045; p.fly = !!viaCoffee; p.hop = 1;
+      S.people.push(p); crowd.push(p); assignDest(p);
+    }
+  };
+  spawn(h, cx, cy, pts, 0);
   burst(cx, cy, PAL[h.color], 16, 190); burst(cx, cy, '#ffffff', 8, 110);
   ring(cx, cy, PAL[h.color]);
   if (h.n === 6) { floatText(cx, cy - 26, '×6!', PAL[h.color], 26); ring(cx, cy, '#ffffff'); S.shake = Math.max(S.shake, 4); tone(300, .2, 'triangle', .14, 2.5, .05); }
+  // carpool: the linked team leaves right behind them, through the same door
+  const pp = partnerIn(S.grid, h);
+  if (pp) {
+    const mate = S.grid[pp[0]][pp[1]]; S.grid[pp[0]][pp[1]] = null;
+    const [mx, my] = cellCenter(pp[0], pp[1]);
+    spawn(mate, mx, my, [[cx, cy], ...pts], h.n * .045 + .12);
+    burst(mx, my, PAL[mate.color], 16, 190); ring(mx, my, PAL[mate.color]);
+    floatText((cx + mx) / 2, (cy + my) / 2 - 30, '🚗 CARPOOL!', '#ffffff', 22);
+    tone(392, .12, 'square', .05); tone(494, .16, 'square', .05, 1, .12);
+    S.shake = Math.max(S.shake, 5); missionAdd('carpools', 1);
+  }
   if (viaCoffee) { burst(cx, cy, '#8b5a2b', 14, 160); floatText(cx, cy - 20, '☕ Caffeinated!', '#ffd9a8', 16); sfx.coffee(); }
   sfx.pop(); buzz(12); S.shake = Math.max(S.shake, 2);
   if (Math.random() < .45) { const p = pick(crowd); S.texts.push({ follow: p, txt: pick(PHR), t: 1.8, max: 1.8, bubble: true }); }
+  afterTap();
+}
+
+function afterTap() {
   S.taps++;
   for (let rr2 = 0; rr2 < S.rows; rr2++) for (let cc = 0; cc < S.cols; cc++) {
     const o = S.grid[rr2][cc];
@@ -405,7 +562,7 @@ function launch(r, c, viaCoffee) {
 const isLocked = h => h.lock && h.lock > S.taps;
 
 function revive() {
-  S.revived = true;
+  S.revived = true; S.usedBoost = true;
   const over = S.people.filter(p => p.dest && p.dest.overflow).length;
   for (let i = 0; i < Math.max(3, over); i++) S.bench.push(null);
   seatOverflow();
@@ -425,6 +582,7 @@ function seatOverflow() {
 function canAfford(b) { return meta.inv[b.id] > 0 || meta.coins >= b.price; }
 function consume(i) {
   const b = BOOSTERS[i];
+  if (canAfford(b)) S.usedBoost = true;
   if (meta.inv[b.id] > 0) { meta.inv[b.id]--; saveMeta(); return true; }
   if (meta.coins >= b.price) {
     meta.coins -= b.price; saveMeta();
@@ -507,7 +665,7 @@ function update(dt) {
       if (b.x < -260) b.state = 'gone';
       continue;
     }
-    const rank = active.indexOf(b);
+    const rank = active.indexOf(b); b.rank = rank;
     const fogged = rank >= S.fog;
     if (b.fog && !fogged && b.x < W) { b.reveal = 1; tone(760, .1, 'triangle', .07, 1.4); }
     b.fog = fogged;
@@ -519,11 +677,12 @@ function update(dt) {
     b.x += (tx - b.x) * k; b.s += (ts - b.s) * k;
     b.wheel += (b.x - ox) / 9;
     if (rank === 0 && b.seated === 3 && Math.abs(b.x - tx) < 6) {
-      b.state = 'leave'; b.vx = -60; sfx.honk();
+      b.state = 'leave'; b.rank = -1; b.vx = -60; sfx.honk();
       if (S.t - S.lastDepart < 2.6) S.combo++; else S.combo = 1;
       S.lastDepart = S.t;
       const pts = 30 * S.combo; S.score += pts;
       floatText(b.x + 85, BUSY - 84, '+' + pts, '#fff', 22);
+      missionMax('combo', S.combo);
       if (S.combo >= 2) {
         floatText(W / 2, 128, 'COMBO x' + S.combo + '!', PAL[(S.combo + 1) % PAL.length], 26 + Math.min(14, S.combo * 2));
         sfx.combo(S.combo); S.flash = .2; S.flashCol = '255,255,255'; S.shake = Math.min(9, 2 + S.combo * 1.5); buzz(25);
@@ -551,7 +710,7 @@ function update(dt) {
       if (!p.arrived) {
         p.arrived = true;
         if (p.dest.bus) {
-          const b = p.dest.bus; b.seats[p.dest.seat] = { skin: p.skin, hair: p.hair, color: p.color, pop: 1 }; b.seated++;
+          const b = p.dest.bus; b.seats[p.dest.seat] = { skin: p.skin, hair: p.hair, color: p.color, pop: 1 }; b.seated++; missionAdd('workers', 1);
           sfx.seat(b.seated - 1); burst(p.x, p.y, PAL[p.color], 6, 80);
           S.score += 5; S.people.splice(i, 1);
         } else if (p.dest.slot !== undefined) { sfx.bench(); p.hop = 1; }
@@ -610,6 +769,7 @@ function update(dt) {
       } else earned = Math.ceil(earned / 2);
       meta.level = Math.max(meta.level, S.level + 1); meta.best = Math.max(meta.best, S.level);
     }
+    missionAdd('wins', 1); if (stars === 3) missionAdd('wins3', 1); if (!S.usedBoost) missionAdd('clean', 1);
     let newBest = false;
     if (!S.daily) {
       const prev = meta.stars[S.level] || 0;
@@ -770,7 +930,7 @@ function drawPerson(p) {
   ctx.fillStyle = col; rr(x - 5, y - 3, 10, 11, 4); ctx.fill();
   ctx.fillStyle = 'rgba(255,255,255,.25)'; rr(x - 5, y - 3, 3, 9, 2); ctx.fill();
   ctx.fillStyle = '#fff'; ctx.fillRect(x - 1.5, y - 3, 3, 2);
-  ctx.fillStyle = '#2a2342'; ctx.fillRect(x - .8, y - 1, 1.6, 5);
+  if (meta.set.sym) drawSym(p.color, x, y + 2.5, 2.6, '#fff'); else { ctx.fillStyle = '#2a2342'; ctx.fillRect(x - .8, y - 1, 1.6, 5); }
   circle(x, y - 8, 5, p.skin);
   ctx.fillStyle = p.hair; ctx.beginPath(); ctx.arc(x, y - 8.6, 5.3, Math.PI * 1.02, Math.PI * 1.98); ctx.fill();
   circle(x - 1.6 + dir * 1.2, y - 7.6, .9, '#1b1424'); circle(x + 1.6 + dir * 1.2, y - 7.6, .9, '#1b1424');
@@ -925,6 +1085,19 @@ function drawBus(b, by = BUSY, skinId = meta.bus) {
     const inset = id === 'limo' ? 30 : 34;
     for (const wx of [x + inset * s, x + w - inset * s]) wheel(wx, by + 1, s, b.wheel);
   }
+  if (!b.fog && meta.set.sym && b.rank !== undefined) {
+    circle(x + w - 14 * s, top + 13 * s, 8.5 * s, '#fff'); drawSym(b.color, x + w - 14 * s, top + 13 * s, 4.8 * s, PAL[b.color]);
+  }
+  if (b.rank === 0 || (b.rank === 1 && !b.fog)) {   // make it obvious which shuttle is loading
+    const roof = top - (id === 'decker' ? 32 * s : 0) - (id === 'rocket' || id === 'limo' ? 4 : 12) * s;
+    const now = b.rank === 0, label = now ? (b.seated === 3 ? 'ALL ABOARD!' : 'NOW BOARDING') : 'NEXT';
+    const pw = now ? 104 : 44, ph = now ? 18 : 14, py = Math.max(64, roof - ph - 4 + (now ? Math.sin(T * 5) * 1.5 : 0));
+    ctx.fillStyle = 'rgba(0,0,0,.3)'; rr(x + w / 2 - pw / 2, py + 2, pw, ph, ph / 2); ctx.fill();
+    ctx.fillStyle = now ? col : 'rgba(20,12,40,.75)'; rr(x + w / 2 - pw / 2, py, pw, ph, ph / 2); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = now ? 2 : 1; ctx.stroke();
+    if (now) { ctx.beginPath(); ctx.moveTo(x + w / 2 - 5, py + ph); ctx.lineTo(x + w / 2 + 5, py + ph); ctx.lineTo(x + w / 2, py + ph + 6); ctx.fillStyle = '#fff'; ctx.fill(); }
+    otxt(label, x + w / 2, py + ph / 2 + .5, now ? 10 : 8, '#fff', 'rgba(20,10,40,.55)', 3);
+  }
   if (b.fog) {
     ctx.fillStyle = 'rgba(20,12,40,.45)'; rr(x, top, w, h, 14 * s); ctx.fill();
     otxt('?', x + w / 2, top + h * .45, 30 * s, '#d8d2ee', 'rgba(20,10,40,.7)', 4 * s);
@@ -952,6 +1125,52 @@ function drawBench() {
   }
 }
 
+// Shift 1 walkthrough: a hand points at the right cubicle for the first few taps.
+function drawTutorial() {
+  const front = logicalFront();
+  let tgt = null;
+  for (let r = 0; r < S.rows && !tgt; r++) for (let c = 0; c < S.cols; c++) {
+    const h = S.grid[r][c];
+    if (h && S.acc[r][c] && !isLocked(h) && front && h.color === front.color) { tgt = [r, c]; break; }
+  }
+  const hy = S.gy + S.rows * S.cell + 30;
+  if (!tgt) {
+    otxt('Waiting for the next shuttle…', W / 2, hy, 14, '#fff');
+    return;
+  }
+  const [x, y] = cellCenter(...tgt), bob = Math.abs(Math.sin(S.t * 4)) * 10;
+  ctx.strokeStyle = `rgba(255,255,255,${.8 - (S.t * 1.5 % 1) * .8})`; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(x, y, S.cell * .3 + (S.t * 1.5 % 1) * S.cell * .3, 0, 7); ctx.stroke();
+  ctx.save(); ctx.translate(x + 6, y + 18 + bob); ctx.rotate(-.35);
+  txt('👆', 0, 0, 34, '#fff'); ctx.restore();
+  const col = PAL[front.color];
+  ctx.fillStyle = 'rgba(20,12,40,.8)'; rr(30, hy - 18, W - 60, 46, 14); ctx.fill();
+  ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+  txt(S.tut >= 3 ? 'Tap the cubicle that matches the shuttle!' : S.tut === 2 ? 'Nice! Keep matching colors.' : 'Wrong colors wait in the break room.', W / 2, hy - 2, 14, '#fff', 'center', 900);
+  txt('Only cubicles with a clear path to the EXIT can be tapped', W / 2, hy + 16, 11, 'rgba(255,255,255,.65)', 'center', 600);
+}
+
+// Cash bag / coffee cup sitting on an empty floor cell; grabbed when the cell links to the exit.
+function drawPickup(pk) {
+  const [x, y0] = cellCenter(pk.r, pk.c), reach = S.acc.reach && S.acc.reach[pk.r][pk.c];
+  const y = y0 + Math.sin(S.t * 3 + pk.r + pk.c) * 3, s = S.cell / 64;
+  ctx.globalAlpha = reach ? 1 : .8;
+  circle(x, y0 + 14 * s, 12 * s, 'rgba(0,0,0,.25)');
+  if (pk.kind === 'coffee') {
+    ctx.fillStyle = '#fff'; rr(x - 9 * s, y - 8 * s, 18 * s, 18 * s, 4 * s); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 3 * s; ctx.beginPath(); ctx.arc(x + 10 * s, y + 1 * s, 5 * s, -1.4, 1.4); ctx.stroke();
+    ctx.fillStyle = '#8b5a2b'; rr(x - 7 * s, y - 6 * s, 14 * s, 4 * s, 2 * s); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.6)'; ctx.lineWidth = 1.5 * s;
+    for (const o of [-3, 3]) { ctx.beginPath(); ctx.moveTo(x + o * s, y - 11 * s); ctx.quadraticCurveTo(x + (o + 3) * s, y - 15 * s, x + o * s, y - 19 * s); ctx.stroke(); }
+  } else {
+    ctx.fillStyle = '#3aa86b'; ctx.beginPath(); ctx.ellipse(x, y + 3 * s, 12 * s, 10 * s, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = '#2d8a56'; rr(x - 5 * s, y - 10 * s, 10 * s, 6 * s, 2 * s); ctx.fill();
+    ctx.fillStyle = '#ffd23f'; rr(x - 7 * s, y - 6 * s, 14 * s, 3 * s, 1.5 * s); ctx.fill();
+    txt('$', x, y + 4 * s, 13 * s, '#eaffef', 'center', 900);
+  }
+  ctx.globalAlpha = 1;
+}
+
 function drawHouse(r, c, h, front) {
   const cs = S.cell, [cx, cy] = cellCenter(r, c), acc = S.acc[r][c];
   const coffee = S.mode === 'coffee';
@@ -961,46 +1180,60 @@ function drawHouse(r, c, h, front) {
   const sc = 1 + (h.reveal > 0 ? h.reveal * .25 : 0);
   const sh = h.shake > 0 ? Math.sin(h.shake * 60) * 5 * h.shake / .3 : 0;
   const match = acc && !h.mystery && front && front.color === h.color;
-  const col = h.mystery ? '#8a83a0' : PAL[h.color];
+  const base = h.mystery ? '#8a83a0' : PAL[h.color];
+  const DIM = '#2a2342';
+  const col = acc ? base : lerpCol(base, DIM, .4);
   const big = h.n === 6 && !h.mystery;
   ctx.save(); ctx.translate(cx + sh, cy - lift); ctx.scale(sc, sc);
+  if (match && !isLocked(h)) {   // soft halo behind cubicles that fit the shuttle at the stop
+    const hg = ctx.createRadialGradient(0, 0, sz * .3, 0, 0, sz * .85);
+    hg.addColorStop(0, base + 'aa'); hg.addColorStop(1, base + '00');
+    ctx.globalAlpha = .55 + .35 * Math.sin(S.t * 6); ctx.fillStyle = hg; ctx.fillRect(-sz, -sz, sz * 2, sz * 2); ctx.globalAlpha = 1;
+  }
   ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(-sz / 2 + 1, -sz / 2 + depth + lift + 2, sz, sz, rad); ctx.fill();
   if (big) {
-    // stacked "second floor" peeking out above — reads as a double-size crowd
-    ctx.fillStyle = acc ? shade(col, -.25) : shade(col, -.65); rr(-sz / 2 + 4, -sz / 2 - 7, sz - 8, sz, rad); ctx.fill();
-    ctx.fillStyle = acc ? shade(col, .1) : shade(col, -.5); rr(-sz / 2 + 4, -sz / 2 - 9, sz - 8, 6, 3); ctx.fill();
+    // stacked "second floor" peeking out above: reads as a double-size team
+    ctx.fillStyle = acc ? shade(base, -.3) : lerpCol(base, '#15102a', .72); rr(-sz / 2 + 4, -sz / 2 - 8, sz - 8, sz, rad); ctx.fill();
+    ctx.fillStyle = acc ? shade(base, .2) : lerpCol(base, DIM, .65); rr(-sz / 2 + 4, -sz / 2 - 10, sz - 8, 6, 3); ctx.fill();
   }
-  ctx.fillStyle = acc ? shade(col, -.4) : '#2f2848'; rr(-sz / 2, -sz / 2 + depth, sz, sz, rad); ctx.fill();
+  ctx.fillStyle = acc ? shade(base, -.38) : lerpCol(base, '#15102a', .66); rr(-sz / 2, -sz / 2 + depth, sz, sz, rad); ctx.fill();
   const face = ctx.createLinearGradient(0, -sz / 2, 0, sz / 2);
-  if (acc) { face.addColorStop(0, '#ffffff'); face.addColorStop(1, '#e6def5'); }
-  else { face.addColorStop(0, '#6a6190'); face.addColorStop(1, '#544b77'); }
+  if (acc) { face.addColorStop(0, shade(base, .3)); face.addColorStop(1, shade(base, -.06)); }
+  else { face.addColorStop(0, lerpCol(base, DIM, .34)); face.addColorStop(1, lerpCol(base, DIM, .5)); }
   ctx.fillStyle = face; rr(-sz / 2, -sz / 2, sz, sz, rad); ctx.fill();
-  ctx.save(); rr(-sz / 2, -sz / 2, sz, sz, rad); ctx.clip();
-  ctx.globalAlpha = acc ? 1 : .6; ctx.fillStyle = col; ctx.fillRect(-sz / 2, -sz / 2, sz, sz * .2);
-  ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.fillRect(-sz / 2, -sz / 2, sz, sz * .05);
-  ctx.restore(); ctx.globalAlpha = 1;
+  ctx.fillStyle = acc ? 'rgba(255,255,255,.3)' : 'rgba(255,255,255,.06)';
+  ctx.beginPath(); ctx.ellipse(0, -sz * .38, sz * .36, sz * .07, 0, 0, 7); ctx.fill();
   if (h.mystery) {
-    txt('?', 0, sz * .1, sz * .46, '#d8d2ee', 'center', 900);
+    otxt('?', 0, sz * .04, sz * .5, acc ? '#fff' : '#a9a1c6', 'rgba(20,10,40,.45)', 3);
   } else {
-    const n = h.n, rowsN = n / 3, hr = rowsN > 1 ? sz * .055 : sz * .072;
+    // bright office window with the team inside
+    const wx = -sz * .38, wy = -sz * .32, ww = sz * .76, wh = sz * .42;
+    ctx.fillStyle = acc ? '#fdfbff' : 'rgba(10,6,24,.35)'; rr(wx, wy, ww, wh, sz * .09); ctx.fill();
+    ctx.save(); rr(wx, wy, ww, wh, sz * .09); ctx.clip();
+    if (acc) { ctx.fillStyle = shade(base, .82); ctx.fillRect(wx, wy + wh * .72, ww, wh * .28); }
+    const n = h.n, rowsN = n / 3, hr = rowsN > 1 ? sz * .062 : sz * .082;
     for (let k = 0; k < n; k++) {
       const row = Math.floor(k / 3), ci = k % 3;
-      const hx = (ci - 1) * sz * .22, hy = -sz * .12 + row * sz * .17 - (rowsN > 1 ? sz * .06 : 0);
-      const peek = acc ? Math.sin(S.t * 7 + k * 1.7 + r + c) * 1.4 : 0;
-      ctx.fillStyle = acc ? col : shade(col, -.55); rr(hx - hr * 1.1, hy + peek + hr * .7, hr * 2.2, hr * 1.5, hr * .6); ctx.fill();
-      circle(hx, hy + peek, hr, acc ? SKIN[(k + r * 3 + c) % SKIN.length] : '#3d3556');
+      const hx = (ci - 1) * sz * .23 + (rowsN > 1 && row === 0 ? sz * .05 : 0);
+      const hy = rowsN > 1 ? wy + wh * (row === 0 ? .32 : .68) : wy + wh * .52;
+      const peek = acc ? Math.sin(S.t * 7 + k * 1.7 + r + c) * 1.3 : 0;
+      ctx.fillStyle = acc ? base : 'rgba(0,0,0,.45)'; rr(hx - hr * 1.2, hy + peek + hr * .75, hr * 2.4, hr * 2, hr * .8); ctx.fill();
+      circle(hx, hy + peek, hr, acc ? SKIN[(k + r * 3 + c) % SKIN.length] : 'rgba(0,0,0,.45)');
       if (acc) { ctx.fillStyle = HAIR[(k * 3 + r + c) % HAIR.length]; ctx.beginPath(); ctx.arc(hx, hy + peek - hr * .15, hr * 1.05, Math.PI * 1.05, Math.PI * 1.95); ctx.fill(); }
     }
-    const dw = sz * .3, dh = sz * .3;
-    ctx.fillStyle = acc ? shade(col, -.1) : shade(col, -.6); rr(-dw / 2, sz / 2 - dh - sz * .05, dw, dh, 4); ctx.fill();
-    circle(dw * .25, sz / 2 - dh * .5 - sz * .05, 1.8, acc ? '#fff' : '#555');
+    ctx.restore();
+    // door
+    const dw = sz * .26, dh = sz * .3, dy = sz / 2 - dh - sz * .04;
+    ctx.fillStyle = acc ? 'rgba(255,255,255,.95)' : 'rgba(255,255,255,.14)'; rr(-dw / 2, dy, dw, dh, sz * .05); ctx.fill();
+    circle(dw * .26, dy + dh * .55, Math.max(1.4, sz * .03), acc ? base : 'rgba(255,255,255,.25)');
+    if (meta.set.sym) drawSym(h.color, -sz * .34, sz * .32, sz * .085, acc ? '#fff' : 'rgba(255,255,255,.45)');
   }
   if (big) {
     const br = Math.max(11.5, sz * .23) * (acc ? 1 + .08 * Math.sin(S.t * 6 + r + c) : 1);
     const bx = sz / 2 - br * .45, by = -sz / 2 + br * .2;
     circle(bx, by + 2, br, 'rgba(0,0,0,.35)');
     circle(bx, by, br, '#fff');
-    circle(bx, by, br - 2.5, acc ? col : shade(col, -.45));
+    circle(bx, by, br - 2.5, acc ? shade(base, -.25) : lerpCol(base, DIM, .55));
     otxt('6', bx, by + 1, br * 1.25, '#fff', 'rgba(20,10,40,.55)', 3);
   }
   const locked = isLocked(h);
@@ -1020,9 +1253,9 @@ function drawHouse(r, c, h, front) {
     txt(`${n} tap${n === 1 ? '' : 's'}`, 0, sz * .2 + 8, 8.5, '#3a2600', 'center', 900);
   }
   if (match && !locked) {
-    ctx.strokeStyle = col; ctx.lineWidth = 3.5; ctx.globalAlpha = .55 + .45 * Math.sin(S.t * 7);
-    rr(-sz / 2 - 3, -sz / 2 - 3, sz + 6, sz + 6, rad + 3); ctx.stroke(); ctx.globalAlpha = 1;
-  } else if (acc) { ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineWidth = 2; rr(-sz / 2, -sz / 2, sz, sz, rad); ctx.stroke(); }
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 3.5; ctx.globalAlpha = .65 + .35 * Math.sin(S.t * 7);
+    rr(-sz / 2 - 2.5, -sz / 2 - 2.5, sz + 5, sz + 5, rad + 2.5); ctx.stroke(); ctx.globalAlpha = 1;
+  } else if (acc) { ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.lineWidth = 1.5; rr(-sz / 2, -sz / 2, sz, sz, rad); ctx.stroke(); }
   if (coffee && !acc && !locked) {
     ctx.strokeStyle = `rgba(255,200,130,${.5 + .5 * Math.sin(S.t * 8)})`; ctx.lineWidth = 3; ctx.setLineDash([5, 4]);
     rr(-sz / 2, -sz / 2, sz, sz, rad); ctx.stroke(); ctx.setLineDash([]);
@@ -1042,11 +1275,49 @@ function drawGrid() {
   ctx.fillStyle = '#ffd23f'; rr(S.gx, S.gy - 12, gw, 4, 2); ctx.fill();
   ctx.fillStyle = '#2bd17e'; rr(W / 2 - 22, S.gy - 34, 44, 15, 4); ctx.fill();
   txt('EXIT', W / 2, S.gy - 26, 10, '#fff', 'center', 900);
+  const reach = S.acc.reach;
   for (let r = 0; r < S.rows; r++) for (let c = 0; c < S.cols; c++) {
-    if (!S.grid[r][c]) { ctx.fillStyle = (r + c) % 2 ? '#352c54' : '#30284d'; ctx.fillRect(S.gx + c * cs + 1, S.gy + r * cs + 1, cs - 2, cs - 2); }
+    if (S.grid[r][c]) continue;
+    const open = reach && reach[r][c];   // walkable route to the exit gets a lighter carpet
+    ctx.fillStyle = open ? ((r + c) % 2 ? '#43386a' : '#3d3262') : ((r + c) % 2 ? '#30284c' : '#2c2446');
+    rr(S.gx + c * cs + 2, S.gy + r * cs + 2, cs - 4, cs - 4, 6); ctx.fill();
   }
+  for (const pk of S.pickups) if (!pk.taken) drawPickup(pk);
   const front = logicalFront();
   for (let r = 0; r < S.rows; r++) for (let c = 0; c < S.cols; c++) { const h = S.grid[r][c]; if (h) drawHouse(r, c, h, front); }
+  drawCarpools();
+}
+
+// A striped hitch across the shared edge of each carpool pair, with a car badge in the middle.
+function drawCarpools() {
+  const cs = S.cell;
+  for (let r = 0; r < S.rows; r++) for (let c = 0; c < S.cols; c++) {
+    const h = S.grid[r][c];
+    if (!h || !h.link) continue;
+    const p = partnerIn(S.grid, h);
+    if (!p || p[0] * 100 + p[1] < r * 100 + c) continue;       // draw each pair once
+    const [x1, y1] = cellCenter(r, c), [x2, y2] = cellCenter(...p);
+    const mx = (x1 + x2) / 2, my = (y1 + y2) / 2, horiz = y1 === y2;
+    const live = S.acc[r][c] || S.acc[p[0]][p[1]];
+    // dashed frame around both cubicles: they act as one unit
+    const fx = Math.min(x1, x2) - cs / 2 + 1, fy = Math.min(y1, y2) - cs / 2 + 1;
+    const fw = Math.abs(x2 - x1) + cs - 2, fh = Math.abs(y2 - y1) + cs - 2;
+    ctx.setLineDash([7, 5]); ctx.lineDashOffset = live ? -S.t * 18 : 0;
+    ctx.strokeStyle = live ? '#ffffff' : 'rgba(255,255,255,.55)'; ctx.lineWidth = live ? 3 : 2;
+    rr(fx, fy, fw, fh, cs * .2); ctx.stroke(); ctx.setLineDash([]); ctx.lineDashOffset = 0;
+    const len = cs * .62, th = Math.max(8, cs * .15);
+    ctx.save(); ctx.translate(mx, my); if (!horiz) ctx.rotate(Math.PI / 2);
+    ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(-len / 2, -th / 2 + 2, len, th, th / 2); ctx.fill();
+    ctx.fillStyle = live ? '#ffffff' : '#9a92b8'; rr(-len / 2, -th / 2, len, th, th / 2); ctx.fill();
+    ctx.save(); rr(-len / 2, -th / 2, len, th, th / 2); ctx.clip();
+    ctx.fillStyle = live ? '#2a2342' : '#5a5276';
+    const off = live ? (S.t * 20) % 10 : 0;
+    for (let x = -len / 2 - 10 + off; x < len / 2; x += 10) { ctx.beginPath(); ctx.moveTo(x, th / 2); ctx.lineTo(x + 5, -th / 2); ctx.lineTo(x + 9, -th / 2); ctx.lineTo(x + 4, th / 2); ctx.fill(); }
+    ctx.restore(); ctx.restore();
+    const br = Math.max(13, cs * .25) * (live ? 1 + .07 * Math.sin(S.t * 6) : 1);
+    circle(mx, my + 2, br, 'rgba(0,0,0,.35)'); circle(mx, my, br, '#fff'); circle(mx, my, br - 2.5, live ? '#35d07f' : '#6a6290');
+    txt('🚗', mx, my + 1, br * 1.05, '#fff');
+  }
 }
 
 function button(x, y, w, h, label, primary, size = 16) {
@@ -1080,9 +1351,10 @@ function drawHUD() {
   const since = S.t - S.lastDepart;
   if (S.combo >= 1 && since < 2.6 && !S.won) {
     const k = 1 - since / 2.6;
-    ctx.fillStyle = 'rgba(20,10,40,.6)'; rr(14, 66, 96, 16, 8); ctx.fill();
-    ctx.fillStyle = PAL[(S.combo + 1) % PAL.length]; rr(14, 66, 96 * k, 16, 8); ctx.fill();
-    txt(S.combo >= 2 ? `🔥 COMBO x${S.combo}` : 'Keep it going!', 62, 74.5, 9.5, '#fff', 'center', 900);
+    const mx = W - 110, my = 80;
+    ctx.fillStyle = 'rgba(20,10,40,.6)'; rr(mx, my, 96, 16, 8); ctx.fill();
+    ctx.fillStyle = PAL[(S.combo + 1) % PAL.length]; rr(mx, my, 96 * k, 16, 8); ctx.fill();
+    txt(S.combo >= 2 ? `🔥 COMBO x${S.combo}` : 'Keep it going!', mx + 48, my + 8.5, 9.5, '#fff', 'center', 900);
   }
 }
 
@@ -1136,11 +1408,67 @@ function openPause() {
     btns: [
       { label: 'Resume ▶', fn: () => { S.panel = null; }, primary: true },
       { label: '⟲ Restart shift', fn: () => startLevel(S.level, S.opts) },
-      { label: muted ? '🔇 Sound: Off' : '🔊 Sound: On', fn: () => { toggleMute(); openPause(); } },
+      { label: '⚙ Settings', fn: () => openSettings(P) },
       { label: '🏢 Back to the map', fn: goHome },
     ],
   };
   showPanel(P); P.t0 = S.t - .3;
+}
+
+function openSettings(back, keepT) {
+  const onOff = v => v ? 'On' : 'Off';
+  const re = () => openSettings(back, true);
+  const P = { pause: true, title: 'Settings', sub: 'Make the office yours.', back,
+    btns: [
+      { label: `🎵 Music: ${onOff(meta.set.music)}`, fn: () => { meta.set.music = !meta.set.music; saveMeta(); re(); } },
+      { label: `🔊 Sound effects: ${onOff(!muted)}`, fn: () => { toggleMute(); re(); } },
+      { label: `📳 Vibration: ${onOff(meta.set.vib)}`, fn: () => { meta.set.vib = !meta.set.vib; saveMeta(); re(); } },
+      { label: `◆ Color symbols: ${onOff(meta.set.sym)}`, fn: () => { meta.set.sym = !meta.set.sym; saveMeta(); re(); } },
+      { label: 'Done', fn: () => { S.panel = back || null; if (S.panel) S.panel.t0 = S.t - 1; }, primary: true },
+    ] };
+  showPanel(P); if (keepT) P.t0 = S.t - 1;
+}
+
+function openTasks() { ensureMissions(); showPanel({ pause: true, tasks: true }); }
+function drawTasks(P, el) {
+  const pop = easeBack(el * 4);
+  ctx.save(); ctx.translate(W / 2, H / 2); ctx.scale(pop, pop); ctx.translate(-W / 2, -H / 2);
+  const px = 22, pw = W - 44, ph = 392, py = (H - ph) / 2;
+  ctx.fillStyle = 'rgba(0,0,0,.4)'; rr(px, py + 8, pw, ph, 24); ctx.fill();
+  const g = ctx.createLinearGradient(0, py, 0, py + ph); g.addColorStop(0, '#4b3d7d'); g.addColorStop(1, '#2e2552');
+  ctx.fillStyle = g; rr(px, py, pw, ph, 24); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.18)'; ctx.lineWidth = 2; ctx.stroke();
+  P.rects = [];
+  otxt("TODAY'S TASKS", px + 22, py + 34, 22, '#fff', 'rgba(20,10,40,.7)', 5, 'left');
+  const cb = { x: px + pw - 58, y: py + 16, w: 42, h: 36, fn: () => { S.panel = null; } };
+  button(cb.x, cb.y, cb.w, cb.h, '✕', false, 18); P.rects.push(cb);
+  meta.missions.list.forEach((m, i) => {
+    const y = py + 72 + i * 96, x = px + 16, w = pw - 32;
+    ctx.fillStyle = m.claimed ? 'rgba(53,208,127,.12)' : 'rgba(0,0,0,.28)'; rr(x, y, w, 84, 16); ctx.fill();
+    txt(taskText(m), x + 16, y + 24, 14, m.claimed ? 'rgba(255,255,255,.55)' : '#fff', 'left', 850);
+    const bw = w - 140, k = m.prog / m.target;
+    ctx.fillStyle = 'rgba(255,255,255,.12)'; rr(x + 16, y + 44, bw, 14, 7); ctx.fill();
+    ctx.fillStyle = m.done ? '#35d07f' : '#ffd23f'; rr(x + 16, y + 44, Math.max(14, bw * k), 14, 7); ctx.fill();
+    txt(`${m.prog}/${m.target}`, x + 16 + bw / 2, y + 51.5, 9.5, '#2a1d00', 'center', 900);
+    const r = { x: x + w - 112, y: y + 22, w: 98, h: 40 };
+    if (m.claimed) txt('✓ Claimed', r.x + r.w / 2, r.y + 20, 13, '#7dffb0', 'center', 900);
+    else if (m.done) {
+      r.fn = () => {
+        m.claimed = true; meta.coins += m.reward; saveMeta();
+        confetti(r.x + r.w / 2, r.y + 10, 30); sfx.win(); floatText(r.x + r.w / 2, r.y - 6, `+$${m.reward}`, '#ffd23f', 22);
+      };
+      const s = 1 + Math.sin(S.t * 6) * .04;
+      ctx.save(); ctx.translate(r.x + r.w / 2, r.y + r.h / 2); ctx.scale(s, s); ctx.translate(-(r.x + r.w / 2), -(r.y + r.h / 2));
+      button(r.x, r.y, r.w, r.h, `Claim $${m.reward}`, true, 13); ctx.restore();
+      P.rects.push(r);
+    } else {
+      ctx.fillStyle = 'rgba(0,0,0,.3)'; rr(r.x + 10, r.y + 6, r.w - 20, 28, 14); ctx.fill();
+      coinIcon(r.x + 30, r.y + 20, 8); txt(String(m.reward), r.x + 44, r.y + 21, 14, '#ffd23f', 'left', 900);
+    }
+  });
+  const now = new Date(), mins = 24 * 60 - (now.getHours() * 60 + now.getMinutes());
+  txt(`New tasks in ${Math.floor(mins / 60)}h ${mins % 60}m`, W / 2, py + ph - 22, 12, 'rgba(255,255,255,.55)', 'center', 700);
+  ctx.restore();
 }
 function askHome() {
   if (S.won || S.taps === 0) return goHome();
@@ -1248,6 +1576,7 @@ function drawPanel() {
   const P = S.panel, el = S.t - P.t0;
   ctx.fillStyle = `rgba(12,8,28,${Math.min(.75, el * 3)})`; ctx.fillRect(0, 0, W, H);
   if (P.shop) return drawShop(P, el);
+  if (P.tasks) return drawTasks(P, el);
   const lines = wrapLines(P.sub, 290, 15);
   const hasStars = P.stars || P.starRow;
   const ph = 78 + (hasStars ? 78 : 0) + lines.length * 21 + (P.coins ? 36 : 0) + (P.extra ? 30 : 0) + (P.teaser ? 24 : 0) + 14 + P.btns.length * 58;
@@ -1296,11 +1625,7 @@ function draw() {
   for (let i = S.buses.length - 1; i >= 0; i--) drawBus(S.buses[i]);
   drawBench();
   drawGrid();
-  if (S.hint && !S.panel) {
-    const a = .6 + .4 * Math.sin(S.t * 5), hy = S.gy + S.rows * S.cell + 34;
-    txt('👆 Tap a glowing cubicle', W / 2, hy, 15, `rgba(255,255,255,${a})`, 'center', 900);
-    txt('Glowing color = matches the shuttle at the stop', W / 2, hy + 22, 12, 'rgba(255,255,255,.6)', 'center', 600);
-  }
+  if (S.tut > 0 && !S.panel && !S.losing) drawTutorial();
   if (S.mode === 'coffee') otxt('☕ Caffeine mode: tap ANY cubicle', W / 2, S.gy + S.rows * S.cell + 30, 14, '#ffd9a8', 'rgba(40,20,0,.7)', 4);
   const ppl = S.people.slice().sort((a, b) => a.y - b.y);
   for (const p of ppl) if (p.delay <= 0) drawPerson(p);
@@ -1366,7 +1691,7 @@ const HOME = { scroll: 0, vel: 0, drag: false, rects: [] };
 const nodeX = L => W / 2 + Math.sin(L * 1.05) * 112;
 const nodeY = L => -(L - 1) * SP + HOME.scroll;
 function clampScroll() {
-  const min = 540, max = 220 + (meta.level + 5) * SP;
+  const min = 400, max = 340 + (meta.level + 6) * SP;
   HOME.scroll = clamp(HOME.scroll, min, Math.max(min, max));
 }
 function homeCenterOn(L) { HOME.scroll = 420 + (L - 1) * SP; HOME.vel = 0; clampScroll(); }
@@ -1385,6 +1710,8 @@ const TIPS = [
   ['fog2', () => S.fog === 2, 'Hidden shuttles', 'From here on you only see the next shuttle in line. Plan ahead!'],
   ['chairs4', () => S.bench.length === 4, 'Budget cuts', 'The break room is down to 4 chairs. Every tap counts.'],
   ['fog1', () => S.fog === 1, 'Total fog', 'Only the shuttle at the stop is visible now. Trust your gut.'],
+  ['carpool', () => S.grid.flat().some(h => h && h.link), 'Carpools', 'Linked cubicles ride home together. Tap either one and BOTH teams leave at once, so time it for when both colors can be handled.'],
+  ['pickup', () => S.pickups.length > 0, 'Loose change', 'Cash bags and coffee sit in closed-off spots. Open a path to them and they are yours.'],
 ];
 function maybeTip() {
   for (const [id, test, title, sub] of TIPS) if (!meta.seen.includes(id) && test()) {
@@ -1463,44 +1790,14 @@ function drawHome() {
   if (view > 90) { // you've left the atmosphere
     circle(330, 300 + (HOME.scroll * .03) % 200, 22, 'rgba(230,230,255,.5)');
   }
-  // the tower itself
-  ctx.fillStyle = 'rgba(25,16,50,.55)'; ctx.fillRect(34, 0, W - 68, H);
-  ctx.fillStyle = 'rgba(255,255,255,.05)'; ctx.fillRect(34, 0, 3, H); ctx.fillRect(W - 37, 0, 3, H);
-  const off = HOME.scroll % 26;
-  for (let y = -26 + off; y < H; y += 26) {
-    const row = Math.floor((y - HOME.scroll) / 26);
-    for (let x = 46; x < W - 50; x += 22) {
-      const lit = ((row * 7 + x * 13) % 11) < 3;
-      ctx.fillStyle = lit ? 'rgba(255,214,120,.22)' : 'rgba(255,255,255,.035)'; ctx.fillRect(x, y, 12, 14);
-    }
-  }
-  // lobby / street at the base
-  const baseY = nodeY(1) + 70;
-  if (baseY < H + 40) {
-    ctx.fillStyle = '#29223d'; ctx.fillRect(0, baseY, W, H);
-    ctx.fillStyle = 'rgba(255,230,150,.35)'; for (let x = 0; x < W; x += 40) ctx.fillRect(x + 10, baseY + 26, 20, 3);
-    ctx.fillStyle = '#2bd17e'; rr(W / 2 - 40, baseY - 22, 80, 18, 5); ctx.fill();
-    txt('LOBBY', W / 2, baseY - 13, 11, '#fff', 'center', 900);
-  }
+  // the office tower: one floor per shift
   const lo = Math.max(1, Math.floor(1 + (HOME.scroll - H - 60) / SP)), hi = Math.floor(1 + (HOME.scroll + 60) / SP) + 1;
-  const maxShow = meta.level + 6;
-  // rank floors
-  for (const [m, name] of RANKS) if (m > 1 && m >= lo && m <= hi + 1 && m <= maxShow) {
-    const y = (nodeY(m - 1) + nodeY(m)) / 2, reached = meta.level >= m;
-    const pathX = (nodeX(m - 1) + nodeX(m)) / 2, left = pathX > W / 2;   // put the label on the side the road isn't
-    ctx.fillStyle = reached ? 'rgba(255,210,63,.18)' : 'rgba(255,255,255,.06)'; ctx.fillRect(34, y - 12, W - 68, 24);
-    txt(`${name.toUpperCase()} FLOORS`, left ? 46 : W - 46, y, 11, reached ? '#ffd23f' : 'rgba(255,255,255,.4)', left ? 'left' : 'right', 900);
-  }
-  // road between floors
-  for (let L = lo; L < Math.min(hi, maxShow); L++) {
-    const x1 = nodeX(L), y1 = nodeY(L), x2 = nodeX(L + 1), y2 = nodeY(L + 1), done = L + 1 <= meta.level;
-    ctx.strokeStyle = done ? 'rgba(255,210,63,.85)' : 'rgba(255,255,255,.22)'; ctx.lineWidth = done ? 7 : 5; ctx.lineCap = 'round';
-    ctx.setLineDash(done ? [] : [2, 12]);
-    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.bezierCurveTo(x1, y1 - SP * .5, x2, y2 + SP * .5, x2, y2); ctx.stroke();
-  }
-  ctx.setLineDash([]);
+  const topFloor = meta.level + 5;
+  for (let L = Math.min(hi, topFloor); L >= lo; L--) drawFloor(L, T);
+  drawConstruction(topFloor, T);
+  drawLobby(T);
   HOME.rects = [];
-  for (let L = lo; L <= Math.min(hi, maxShow); L++) drawNode(L, T, L > meta.level + 3 ? clamp(1 - (L - meta.level - 3) / 3.5, 0, 1) : 1);
+  for (let L = lo; L <= Math.min(hi, topFloor); L++) drawNode(L, T, L > meta.level + 3 ? clamp(1 - (L - meta.level - 3) / 3, .35, 1) : 1);
   // you-are-here worker beside the current floor
   const cx = nodeX(meta.level), cy = nodeY(meta.level);
   if (cy > MAP_TOP - 40 && cy < MAP_BOT + 40) {
@@ -1509,6 +1806,137 @@ function drawHome() {
     drawPerson({ x: 0, y: Math.sin(T * 5) * 1.5, color: meta.level % PAL.length, skin: SKIN[1], hair: HAIR[0], bag: true, path: [], moving: false, phase: 0, hop: Math.max(0, Math.sin(T * 4)) * .5, dir: -side, look: meta.look, fly: false, delay: 0 }); ctx.restore();
   }
   drawHomeChrome(T);
+}
+
+const BX0 = 28, BX1 = W - 28, PANES = 6;
+const hash = (a, b) => { let h = (a * 374761393 + b * 668265263) | 0; h = (h ^ (h >>> 13)) * 1274126177; return ((h ^ (h >>> 16)) >>> 0) / 4294967296; };
+
+// What you see through one office window: a little scene picked per floor/pane.
+function drawInterior(x, y, w, h, L, i, lit, T) {
+  const k = Math.floor(hash(L, i) * 6), sil = lit ? 'rgba(70,45,40,.55)' : 'rgba(0,0,0,.35)', fl = y + h;
+  ctx.fillStyle = sil;
+  if (k === 0) { ctx.fillRect(x + w * .15, fl - h * .3, w * .7, h * .06); ctx.fillRect(x + w * .2, fl - h * .24, w * .05, h * .24); ctx.fillRect(x + w * .75, fl - h * .24, w * .05, h * .24); ctx.fillRect(x + w * .38, fl - h * .52, w * .3, h * .2); }
+  else if (k === 1) { circle(x + w * .5, fl - h * .5, w * .2, lit ? 'rgba(60,120,70,.6)' : sil); ctx.fillStyle = sil; ctx.fillRect(x + w * .38, fl - h * .3, w * .24, h * .3); }
+  else if (k === 2) { rr(x + w * .38, fl - h * .62, w * .24, h * .62, 3); ctx.fill(); circle(x + w * .5, fl - h * .7, w * .12, lit ? 'rgba(120,190,255,.7)' : sil); }
+  else if (k === 3) { ctx.fillRect(x + w * .12, fl - h * .78, w * .76, h * .05); ctx.fillRect(x + w * .12, fl - h * .5, w * .76, h * .05); ctx.fillRect(x + w * .12, fl - h * .22, w * .76, h * .05); }
+  else if (k === 4 && lit) {   // someone still at their desk
+    const bob = Math.sin(T * 2 + L + i) * 1.5;
+    circle(x + w * .5, fl - h * .55 + bob, w * .1, sil); rr(x + w * .36, fl - h * .44 + bob, w * .28, h * .44, 4); ctx.fill();
+    ctx.fillRect(x + w * .1, fl - h * .3, w * .8, h * .06);
+  } else { ctx.fillRect(x + w * .1, fl - h * .3, w * .8, h * .06); ctx.fillRect(x + w * .55, fl - h * .5, w * .25, h * .2); }
+}
+
+function drawFloor(L, T) {
+  const y = nodeY(L), top = y - SP / 2, bot = y + SP / 2;
+  if (bot < MAP_TOP - 20 || top > MAP_BOT + 20) return;
+  const done = L < meta.level, cur = L === meta.level, boss = isBoss(L), lit = done || cur;
+  // facade
+  const fg = ctx.createLinearGradient(BX0, 0, BX1, 0);
+  fg.addColorStop(0, '#5a4f86'); fg.addColorStop(.5, '#6a5f98'); fg.addColorStop(1, '#4c4275');
+  ctx.fillStyle = fg; ctx.fillRect(BX0, top, BX1 - BX0, SP);
+  // window band
+  const wy = top + 10, wh = SP - 30, inner = BX1 - BX0 - 24, pw = (inner - (PANES - 1) * 5) / PANES;
+  for (let i = 0; i < PANES; i++) {
+    const wx = BX0 + 12 + i * (pw + 5);
+    const g = ctx.createLinearGradient(0, wy, 0, wy + wh);
+    if (!lit) { g.addColorStop(0, '#22305e'); g.addColorStop(1, '#162043'); }
+    else if (boss) { g.addColorStop(0, '#ffd1c4'); g.addColorStop(1, '#f59a8a'); }
+    else if (cur) { g.addColorStop(0, '#fff8d8'); g.addColorStop(1, '#ffd77a'); }
+    else { g.addColorStop(0, '#ffe9b0'); g.addColorStop(1, '#f2bd62'); }
+    ctx.fillStyle = g; ctx.fillRect(wx, wy, pw, wh);
+    if (lit) {
+      ctx.save(); ctx.beginPath(); ctx.rect(wx, wy, pw, wh); ctx.clip();
+      if (boss) { ctx.fillStyle = 'rgba(90,40,40,.5)'; ctx.fillRect(wx - 3, wy + wh * .66, pw + 6, wh * .08); }
+      else drawInterior(wx, wy, pw, wh, L, i, true, T);
+      ctx.restore();
+      ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.fillRect(wx, wy, pw, 3);
+    } else {
+      ctx.save(); ctx.beginPath(); ctx.rect(wx, wy, pw, wh); ctx.clip();
+      ctx.fillStyle = 'rgba(255,255,255,.08)'; ctx.beginPath(); ctx.moveTo(wx + pw * .2, wy); ctx.lineTo(wx + pw * .55, wy); ctx.lineTo(wx + pw * .1, wy + wh); ctx.lineTo(wx - pw * .25, wy + wh); ctx.fill();
+      ctx.restore();
+    }
+    ctx.strokeStyle = 'rgba(30,22,55,.6)'; ctx.lineWidth = 1.5; ctx.strokeRect(wx, wy, pw, wh);
+  }
+  // pillars + floor slab
+  ctx.fillStyle = '#3d3462'; ctx.fillRect(BX0, top, 8, SP); ctx.fillRect(BX1 - 8, top, 8, SP);
+  const rank = RANKS.find(([m]) => m === L && m > 1);
+  const slabH = rank ? 18 : 10;
+  ctx.fillStyle = rank ? (meta.level >= L ? '#ffd23f' : '#8a7f4a') : '#8d82b3'; ctx.fillRect(BX0 - 4, bot - slabH, BX1 - BX0 + 8, slabH);
+  ctx.fillStyle = 'rgba(255,255,255,.25)'; ctx.fillRect(BX0 - 4, bot - slabH, BX1 - BX0 + 8, 2);
+  ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(BX0, bot, BX1 - BX0, 3);
+  if (rank) txt(`${rank[1].toUpperCase()} FLOORS`, W / 2, bot - 8.5, 10, meta.level >= L ? '#3a2600' : 'rgba(255,255,255,.6)', 'center', 900);
+  // floor number on the left pillar plate
+  ctx.fillStyle = 'rgba(20,12,40,.7)'; rr(BX0 - 2, top + 14, 22, 14, 4); ctx.fill();
+  txt(String(L), BX0 + 9, top + 21.5, 8.5, lit ? '#ffe27a' : 'rgba(255,255,255,.45)', 'center', 900);
+}
+
+function drawConstruction(topFloor, T) {
+  const base = nodeY(topFloor) - SP / 2;            // top edge of the last finished floor
+  if (base < -260 || base > H + 20) return;
+  const beam = '#ff8a3d', dark = '#c65a1e';
+  for (let f = 0; f < 2; f++) {
+    const b = base - f * SP, t = b - SP;
+    ctx.fillStyle = beam;
+    for (let x = BX0; x <= BX1 - 8; x += (BX1 - BX0 - 8) / 5) ctx.fillRect(x, t, 8, SP);
+    ctx.fillRect(BX0, t, BX1 - BX0, 8);
+    ctx.strokeStyle = dark; ctx.lineWidth = 3;
+    for (let i = 0; i < 5; i++) {
+      if ((i + f) % 2) continue;
+      const x0 = BX0 + 4 + i * (BX1 - BX0 - 8) / 5, x1 = x0 + (BX1 - BX0 - 8) / 5;
+      ctx.beginPath(); ctx.moveTo(x0, t + 8); ctx.lineTo(x1, b); ctx.moveTo(x1, t + 8); ctx.lineTo(x0, b); ctx.stroke();
+    }
+  }
+  // crane on the roof
+  const roof = base - 2 * SP, mx = BX1 - 70, mTop = roof - 150;
+  ctx.fillStyle = '#ffd23f'; ctx.fillRect(mx, mTop, 14, roof - mTop);
+  ctx.strokeStyle = '#c99a00'; ctx.lineWidth = 2;
+  for (let y = mTop; y < roof; y += 14) { ctx.beginPath(); ctx.moveTo(mx, y); ctx.lineTo(mx + 14, y + 14); ctx.stroke(); }
+  ctx.fillStyle = '#ffd23f'; ctx.fillRect(mx - 230, mTop, 300, 10); ctx.fillRect(mx + 40, mTop + 10, 26, 18);
+  ctx.fillStyle = '#3d3462'; ctx.fillRect(mx - 6, mTop - 20, 26, 20);
+  const sway = Math.sin(T * 1.2) * 10, hx = mx - 150 + sway, hy = mTop + 80 + Math.sin(T * .9) * 6;
+  ctx.strokeStyle = '#2a2342'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(mx - 150, mTop + 10); ctx.lineTo(hx, hy); ctx.stroke();
+  ctx.fillStyle = beam; ctx.save(); ctx.translate(hx, hy + 4); ctx.rotate(sway * .01); ctx.fillRect(-36, 0, 72, 8); ctx.restore();
+  circle(mx + 7, mTop - 22, 3, Math.sin(T * 4) > 0 ? '#ff3b4f' : '#6a2030');
+  ctx.fillStyle = 'rgba(20,12,40,.8)'; rr(BX0 + 30, base - SP + 22, 170, 30, 8); ctx.fill();
+  ctx.strokeStyle = '#ffd23f'; ctx.lineWidth = 2; ctx.stroke();
+  txt('🚧 MORE FLOORS COMING', BX0 + 115, base - SP + 37.5, 11, '#ffd23f', 'center', 900);
+}
+
+function drawLobby(T) {
+  const g0 = nodeY(1) + SP / 2;                       // ground-floor ceiling
+  if (g0 > H + 20) return;
+  const lb = g0 + 104;
+  ctx.fillStyle = '#3a3160'; ctx.fillRect(BX0, g0, BX1 - BX0, lb - g0);
+  // company sign
+  ctx.fillStyle = '#1f1838'; rr(W / 2 - 110, g0 + 8, 220, 26, 6); ctx.fill();
+  ctx.strokeStyle = '#ffd23f'; ctx.lineWidth = 2; ctx.stroke();
+  txt('QUITTING TIME CO.', W / 2, g0 + 21.5, 14, '#ffd23f', 'center', 900);
+  // side windows
+  for (const sx of [BX0 + 14, BX1 - 94]) {
+    const g = ctx.createLinearGradient(0, g0 + 42, 0, lb); g.addColorStop(0, '#fff2c4'); g.addColorStop(1, '#f2bd62');
+    ctx.fillStyle = g; ctx.fillRect(sx, g0 + 42, 80, lb - g0 - 52);
+    ctx.strokeStyle = 'rgba(30,22,55,.6)'; ctx.lineWidth = 2; ctx.strokeRect(sx, g0 + 42, 80, lb - g0 - 52); ctx.beginPath(); ctx.moveTo(sx + 40, g0 + 42); ctx.lineTo(sx + 40, lb - 10); ctx.stroke();
+    ctx.fillStyle = 'rgba(70,45,40,.5)'; ctx.fillRect(sx + 8, lb - 28, 64, 6);
+  }
+  // awning + revolving door
+  ctx.fillStyle = '#ff5a5f';
+  for (let i = 0; i < 6; i++) { ctx.fillStyle = i % 2 ? '#fff' : '#ff5a5f'; ctx.fillRect(W / 2 - 66 + i * 22, g0 + 40, 22, 12); }
+  ctx.fillStyle = '#cfe9ff'; rr(W / 2 - 54, g0 + 52, 108, lb - g0 - 52, 4); ctx.fill();
+  ctx.strokeStyle = '#2a2342'; ctx.lineWidth = 3; ctx.strokeRect(W / 2 - 54, g0 + 52, 108, lb - g0 - 52);
+  const ang = T * 1.3;
+  for (let k = 0; k < 2; k++) { const dx = Math.cos(ang + k * Math.PI / 2) * 40; ctx.beginPath(); ctx.moveTo(W / 2 - dx, g0 + 56); ctx.lineTo(W / 2 - dx, lb - 4); ctx.lineTo(W / 2 + dx, lb - 4); ctx.lineTo(W / 2 + dx, g0 + 56); ctx.stroke(); }
+  ctx.beginPath(); ctx.moveTo(W / 2, g0 + 52); ctx.lineTo(W / 2, lb); ctx.stroke();
+  // sidewalk, street, trees, lamp and a shuttle waiting at the curb
+  ctx.fillStyle = '#8d82b3'; ctx.fillRect(0, lb, W, 14);
+  ctx.fillStyle = '#29223d'; ctx.fillRect(0, lb + 14, W, H);
+  ctx.fillStyle = 'rgba(255,230,150,.4)'; for (let x = 0; x < W; x += 40) ctx.fillRect(x + 10, lb + 42, 20, 3);
+  for (const tx of [12, W - 12]) {
+    ctx.fillStyle = '#5a3a2a'; ctx.fillRect(tx - 3, lb - 40, 6, 40);
+    circle(tx, lb - 46, 18, '#2f9a5f'); circle(tx - 8, lb - 54, 12, '#3ab070'); circle(tx + 8, lb - 52, 11, '#45c07d');
+  }
+  ctx.fillStyle = '#2a2342'; ctx.fillRect(W / 2 + 76, lb - 70, 4, 70); circle(W / 2 + 78, lb - 72, 7, '#fff3a6');
+  const bus = { x: 26, s: .62, color: (Math.floor(T / 3)) % PAL.length, route: 5, state: 'q', bob: T * 6, wheel: 0, assigned: 0, seats: [null, null, null] };
+  drawBus(bus, lb + 50, meta.bus);
 }
 
 function drawNode(L, T, alpha) {
@@ -1584,20 +2012,21 @@ function drawHomeChrome(T) {
   button(pb.x, pb.y, pb.w, pb.h, boss ? `⚠ REVIEW · SHIFT ${meta.level} ▶` : `PLAY SHIFT ${meta.level} ▶`, true, 20);
   ctx.restore();
   HOME.rects.unshift(pb);
-  const bw3 = (W - 56 - 20) / 3, by = MAP_BOT + 80;
+  const bw3 = (W - 56 - 24) / 4, by = MAP_BOT + 80;
   const dAvail = dailyAvailable(), dDone = meta.daily.last === dayIndex();
   const items = [
     { label: dDone ? '✓ Daily' : '🔥 Daily', fn: () => {
         if (dAvail) playLevel(meta.level, { daily: true });
         else { sfx.nope(); floatText(W / 2, by - 10, dDone ? 'Come back tomorrow for a new one!' : 'Unlocks after Shift 3', '#ffd9a8', 14); }
       }, dot: dAvail },
+    { label: 'Tasks', fn: openTasks, dot: tasksClaimable() > 0 },
     { label: 'Shop', fn: openShop, dot: canBuyAnything() },
-    { label: muted ? '🔇 Sound' : '🔊 Sound', fn: toggleMute },
+    { label: 'Settings', fn: () => openSettings(null) },
   ];
   items.forEach((it, i) => {
-    const r = { x: 28 + i * (bw3 + 10), y: by, w: bw3, h: 40, fn: it.fn };
+    const r = { x: 28 + i * (bw3 + 8), y: by, w: bw3, h: 40, fn: it.fn };
     ctx.globalAlpha = i === 0 && !dAvail ? .6 : 1;
-    button(r.x, r.y, r.w, r.h, it.label, false, 14);
+    button(r.x, r.y, r.w, r.h, it.label, false, 13);
     ctx.globalAlpha = 1;
     if (it.dot) circle(r.x + r.w - 6, r.y + 4, 5 + Math.sin(T * 6), '#ff5a5f');
     HOME.rects.unshift(r);
@@ -1703,6 +2132,9 @@ if (meta.level === 1 && !meta.best) {
 }
 function frame(dt) {
   update(dt);
+  const fill = mode === 'game' && !S.panel ? S.bench.filter(Boolean).length / S.bench.length : 0;
+  MUSIC.tense += ((fill >= .6 ? 1 : 0) - MUSIC.tense) * Math.min(1, dt * 2);
+  try { musicTick(); } catch (e) {}
   if (mode === 'home') { homeUpdate(dt); drawHomeFrame(); } else draw();
 }
 let last = performance.now();
